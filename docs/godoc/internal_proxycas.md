@@ -34,6 +34,15 @@ response only contains that window's terms, so the FIRST fetch for a file must
 always be for the whole thing, regardless of what the downstream caller actually
 asked for - IngestFileRecon assumes a complete list.
 
+A file often cites only part of a shared xorb (Xet dedups across files/repos).
+Those bytes cannot reproduce the original xorb's hash, but they are still
+a complete chunk stream: ensureFileReconCached repackages each contiguous
+fetch_info group as a new xorb under its own content hash and rewrites the
+file's terms to point at it. No partial slice is ever stored under the original
+hash, and the file remains fully servable after the handoff to a plain xetd.
+Only when fetch_info leaves a gap in a term's coverage does the request fall
+back to a live relay (correctness is preserved, but that file is not cached).
+
 -no-cache disables all of the above: every request is relayed live to upstream
 via internal/hfclient directly, embedded is never touched.
 

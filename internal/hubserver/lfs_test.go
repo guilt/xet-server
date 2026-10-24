@@ -465,20 +465,20 @@ func TestLFSLocks_SurviveSnapshot(t *testing.T) {
 
 func TestSplitLFSPath(t *testing.T) {
 	cases := []struct {
-		rest, repo, endpoint string
-		ok                   bool
+		rest, repoType, repo, endpoint string
+		ok                             bool
 	}{
-		{"team/game.git/info/lfs/objects/batch", "team/game", "objects/batch", true},
-		{"datasets/team/game.git/info/lfs/locks/verify", "team/game", "locks/verify", true},
-		{"team/game.git/info/lfs", "team/game", "", true},
-		{"game.git/info/lfs/objects/batch", "", "", false},
-		{"/.git/info/lfs/objects/batch", "", "", false},
-		{"team/game/resolve/main/x", "", "", false},
+		{"team/game.git/info/lfs/objects/batch", "model", "team/game", "objects/batch", true},
+		{"datasets/team/game.git/info/lfs/locks/verify", "dataset", "team/game", "locks/verify", true},
+		{"team/game.git/info/lfs", "model", "team/game", "", true},
+		{"game.git/info/lfs/objects/batch", "", "", "", false},
+		{"/.git/info/lfs/objects/batch", "", "", "", false},
+		{"team/game/resolve/main/x", "", "", "", false},
 	}
 	for _, c := range cases {
-		repo, ep, ok := splitLFSPath(c.rest)
-		if ok != c.ok || repo != c.repo || ep != c.endpoint {
-			t.Errorf("splitLFSPath(%q) = %q, %q, %v; want %q, %q, %v", c.rest, repo, ep, ok, c.repo, c.endpoint, c.ok)
+		repoType, repo, ep, ok := splitLFSPath(c.rest)
+		if ok != c.ok || repoType != c.repoType || repo != c.repo || ep != c.endpoint {
+			t.Errorf("splitLFSPath(%q) = %q, %q, %q, %v; want %q, %q, %q, %v", c.rest, repoType, repo, ep, ok, c.repoType, c.repo, c.endpoint, c.ok)
 		}
 	}
 }

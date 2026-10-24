@@ -23,7 +23,9 @@ info:
     - **401 Unauthorized** - no `Authorization` header, or a token that
       fails validation entirely (wrong token, malformed header).
     - **403 Forbidden** - a valid token that lacks the scope (`read` or
-      `write`) the endpoint requires.
+      `write`) the endpoint requires, or a token minted for a different
+      repository than the one named in the route. The shared secret is
+      unrestricted; only minted tokens carry a repo binding.
 
     In this UI, use **Authorize** and paste the same secret the server was
     started with; it is sent as `Authorization: Bearer <token>` on every
@@ -656,18 +658,20 @@ paths:
       tags: [CAS]
       summary: Global chunk-dedup lookup
       description: >-
-        Requires read scope. {prefix} must be the literal
-        "default-merkledb" (distinct from the xorb-upload prefix). Returns
-        the RAW BYTES of whichever previously-uploaded shard referenced
-        this chunk hash - not the chunk itself; the client re-parses the
-        returned shard to find dedup-eligible chunks. This is the real
-        wire contract per xet-core's own OpenAPI spec.
+        Requires read scope. {prefix} may be "default-merkledb" (the
+        documented value) or "default" (what xet-core >= 1.5 clients
+        actually send). Returns a complete, xorb-only shard FILE whose
+        chunk hashes are keyed with a fresh random key in the footer
+        (chunk_hash_hmac_key): a client can match only chunks it already
+        holds. No file-reconstruction entries are included. This is the
+        real wire contract per xet-core's own OpenAPI spec and
+        export_as_keyed_shard.
       parameters:
-        - { name: prefix, in: path, required: true, schema: { type: string, enum: [default-merkledb] } }
+        - { name: prefix, in: path, required: true, schema: { type: string, enum: [default-merkledb, default] } }
         - { name: hash, in: path, required: true, schema: { type: string }, description: Chunk hash, hex. }
       responses:
         '200':
-          description: Raw bytes of a shard that referenced this chunk hash.
+          description: Complete keyed, xorb-only shard file that referenced this chunk hash.
           content:
             application/octet-stream:
               schema: { type: string, format: binary }
@@ -854,9 +858,10 @@ paths:
       tags: [Hub]
       summary: Issue a CAS endpoint + bearer token (read)
       description: >-
-        Requires read scope. Functionally identical to the write-token
-        endpoint below (this shim issues an unrestricted token either
-        way) except for which scope gates it.
+        Requires read scope. The issued token is bound to this repo (type
+        and ID are inside the signed payload) and expires; presenting it on
+        another repo's route is 403. Functionally identical to the
+        write-token endpoint below except for which scope gates it.
       parameters:
         - { name: repo_type, in: path, required: true, schema: { type: string }, example: model }
         - { name: repo_id, in: path, required: true, schema: { type: string }, example: alice/my-model }
@@ -879,7 +884,7 @@ paths:
     get:
       tags: [Hub]
       summary: Issue a CAS endpoint + bearer token (write)
-      description: Requires write scope. See xet-read-token - identical response shape.
+      description: Requires write scope and a credential scoped to this repo (or the unrestricted shared secret). See xet-read-token - identical response shape and repo binding.
       parameters:
         - { name: repo_type, in: path, required: true, schema: { type: string }, example: model }
         - { name: repo_id, in: path, required: true, schema: { type: string }, example: alice/my-model }

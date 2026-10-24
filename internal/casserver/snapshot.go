@@ -232,15 +232,14 @@ func (s *Server) LoadSnapshot(path string) error {
 		s.chunkHashToShard = snap.ChunkHashToShard
 	}
 	if snap.ShardBodies != nil {
-		// Bodies saved by a build that served uploads back raw are
-		// rebuilt into complete shard files (see dedupShardBody).
+		// Bodies are stored exactly as uploaded. A build before the keyed
+		// dedup fix may have stored a footer-carrying (still raw-hash)
+		// body instead; ReadShard accepts both shapes, and dedupAnswer
+		// keys whatever it parses, so no migration is needed.
 		for hash, body := range snap.ShardBodies {
 			shard, err := shardformat.ReadShard(bytes.NewReader(body))
 			if err != nil {
 				continue
-			}
-			if served, err := dedupShardBody(shard, body); err == nil {
-				snap.ShardBodies[hash] = served
 			}
 			for _, x := range shard.Xorbs {
 				if _, exists := s.xorbToShard[x.Header.XorbHash]; !exists {

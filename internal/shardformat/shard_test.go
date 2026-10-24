@@ -231,3 +231,54 @@ func TestReadShard_RealHFXetCapture(t *testing.T) {
 		t.Errorf("xorb has %d chunks, want 9", len(shard.Xorbs[0].Chunks))
 	}
 }
+
+// TestWriteKeyedShardExpiring_KeyEveryChunkAndNothingElse pins the shape
+// xet-core's export_as_keyed_shard produces: every chunk hash in both the
+// xorb-info section and the chunk lookup table is DataHash::hmac(key), the
+// key appears in the footer, and xorb/file identity is untouched.
+func TestWriteKeyedShardExpiring_KeyEveryChunkAndNothingElse(t *testing.T) {
+	xorb := hashFromByte(0x11)
+	chunks := []merklehash.Hash{hashFromByte(0xA1), hashFromByte(0xA2)}
+	key := hashFromByte(0x7E)
+	xorbs := []XorbEntry{{
+		Header: XorbChunkSequenceHeader{XorbHash: xorb, NumEntries: 2, NumBytesInXorb: 30},
+		Chunks: []XorbChunkSequenceEntry{
+			{ChunkHash: chunks[0], ChunkByteRangeStart: 0, UnpackedSegmentBytes: 10},
+			{ChunkHash: chunks[1], ChunkByteRangeStart: 10, UnpackedSegmentBytes: 20},
+		},
+	}}
+
+	var buf bytes.Buffer
+	footer, err := WriteKeyedShardExpiring(&buf, xorbs, key, NoExpiry)
+	if err != nil {
+		t.Fatalf("WriteKeyedShardExpiring() error = %v", err)
+	}
+	if footer.ChunkHashHMACKey != key {
+		t.Errorf("footer key = %s, want %s", footer.ChunkHashHMACKey.Hex(), key.Hex())
+	}
+	shard, err := ReadShard(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("ReadShard() error = %v", err)
+	}
+	if len(shard.Files) != 0 {
+		t.Errorf("keyed shard has %d file entries, want none", len(shard.Files))
+	}
+	if shard.Footer.ChunkHashHMACKey != key || shard.Footer.ChunkLookupNumEntry != 2 {
+		t.Fatalf("key=%s chunkLookup=%d, want key=%s and 2", shard.Footer.ChunkHashHMACKey.Hex(), shard.Footer.ChunkLookupNumEntry, key.Hex())
+	}
+	if len(shard.Xorbs) != 1 || shard.Xorbs[0].Header.XorbHash != xorb {
+		t.Fatalf("xorb identity changed: %+v", shard.Xorbs)
+	}
+	for i, c := range shard.Xorbs[0].Chunks {
+		if want := chunks[i].HMAC(key); c.ChunkHash != want {
+			t.Errorf("chunk %d = %s, want keyed %s", i, c.ChunkHash.Hex()[:8], want.Hex()[:8])
+		}
+		if c.ChunkHash == chunks[i] {
+			t.Errorf("chunk %d still carries its raw hash", i)
+		}
+	}
+
+	if _, err := WriteKeyedShardExpiring(&buf, xorbs, merklehash.Hash{}, NoExpiry); err == nil {
+		t.Error("writing with a zero key must fail")
+	}
+}

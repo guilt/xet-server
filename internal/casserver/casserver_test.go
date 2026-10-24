@@ -630,9 +630,12 @@ func TestChunkDedup_KnownChunkReturnsShardBytes(t *testing.T) {
 	if len(answer.Xorbs) != 1 || answer.Xorbs[0].Header.XorbHash != xorbHash || len(answer.Xorbs[0].Chunks) != len(chunkHashes) {
 		t.Errorf("chunk dedup response xorb-info = %d xorb(s), want the uploaded xorb %s with %d chunks", len(answer.Xorbs), xorbHash.Hex()[:8], len(chunkHashes))
 	}
+	if answer.Footer.ChunkHashHMACKey.IsZero() {
+		t.Fatal("chunk dedup response has a zero HMAC key: every chunk hash is exposed unkeyed")
+	}
 	for i, c := range answer.Xorbs[0].Chunks {
-		if c.ChunkHash != chunkHashes[i] {
-			t.Errorf("chunk dedup response chunk %d = %s, want %s", i, c.ChunkHash.Hex()[:8], chunkHashes[i].Hex()[:8])
+		if want := chunkHashes[i].HMAC(answer.Footer.ChunkHashHMACKey); c.ChunkHash != want {
+			t.Errorf("chunk dedup response chunk %d = %s, want keyed %s", i, c.ChunkHash.Hex()[:8], want.Hex()[:8])
 		}
 	}
 

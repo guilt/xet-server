@@ -23,12 +23,12 @@ import (
 // Errors after the body has started cannot change the status any more;
 // they are logged and the connection is cut short, which git-lfs's own
 // size and hash checks turn into a retry or a clear failure.
-func (s *Server) handleLFSObject(w http.ResponseWriter, r *http.Request, repoID, oid string) {
+func (s *Server) handleLFSObject(w http.ResponseWriter, r *http.Request, repo auth.Repo, oid string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		lfsError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if _, ok := s.lfsAuthenticate(w, r, auth.ScopeRead); !ok {
+	if _, ok := s.lfsAuthenticate(w, r, auth.ScopeRead, repo); !ok {
 		return
 	}
 	if !isLFSOID(oid) {

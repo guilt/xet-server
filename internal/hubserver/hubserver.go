@@ -219,6 +219,24 @@ func (s *Server) requireScope(w http.ResponseWriter, r *http.Request, scope auth
 	return ok
 }
 
+// requireRepoScope authenticates r and additionally requires that the
+// credential may act on repo. A minted token carries its repo in the
+// MACed payload, so a token for alice/one presented on a bob/two route is
+// rejected here with 403; the shared secret, no-auth, and any custom
+// Authenticator principal not implementing auth.RepoScopedPrincipal remain
+// unrestricted (see auth.AllowsRepo).
+func (s *Server) requireRepoScope(w http.ResponseWriter, r *http.Request, scope auth.Scope, repo auth.Repo) (auth.Principal, bool) {
+	principal, ok := s.authenticate(w, r, scope)
+	if !ok {
+		return nil, false
+	}
+	if !auth.AllowsRepo(principal, repo) {
+		httpErrorJSON(w, "credential is not scoped to repository "+repo.String(), http.StatusForbidden)
+		return nil, false
+	}
+	return principal, true
+}
+
 // authenticate is requireScope returning the Principal too, for the
 // routes that need to know WHO passed (the token routes bind the minted
 // token to the caller's subject; git-lfs locks record it as the owner).
@@ -294,26 +312,27 @@ func (s *Server) handleAPIGet(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	repo := auth.Repo{Type: repoType, ID: repoID}
 	switch tail[0] {
 	case "xet-read-token":
-		principal, ok := s.authenticate(w, r, auth.ScopeRead)
+		principal, ok := s.requireRepoScope(w, r, auth.ScopeRead, repo)
 		if !ok {
 			return
 		}
 		s.handleXetToken(w, r, repoType, repoID, auth.ScopeRead, principal.Subject())
 	case "xet-write-token":
-		principal, ok := s.authenticate(w, r, auth.ScopeWrite)
+		principal, ok := s.requireRepoScope(w, r, auth.ScopeWrite, repo)
 		if !ok {
 			return
 		}
 		s.handleXetToken(w, r, repoType, repoID, auth.ScopeWrite, principal.Subject())
 	case "revision":
-		if !s.requireScope(w, r, auth.ScopeRead) {
+		if _, ok := s.requireRepoScope(w, r, auth.ScopeRead, repo); !ok {
 			return
 		}
 		s.handleRepoInfo(w, r, repoType, repoID, tail[1])
 	case "tree":
-		if !s.requireScope(w, r, auth.ScopeRead) {
+		if _, ok := s.requireRepoScope(w, r, auth.ScopeRead, repo); !ok {
 			return
 		}
 		// tail[2:] is the optional path-in-repo, itself a single
@@ -336,10 +355,11 @@ func (s *Server) handleAPIGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAPIPost(w http.ResponseWriter, r *http.Request) {
 	rest := r.PathValue("rest")
 	if rest == "repos/create" {
-		if !s.requireScope(w, r, auth.ScopeWrite) {
+		principal, ok := s.authenticate(w, r, auth.ScopeWrite)
+		if !ok {
 			return
 		}
-		s.handleCreateRepo(w, r)
+		s.handleCreateRepo(w, r, principal)
 		return
 	}
 	repoType, repoID, tail, ok := splitRepoPath(rest)
@@ -347,20 +367,21 @@ func (s *Server) handleAPIPost(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	repo := auth.Repo{Type: repoType, ID: repoID}
 	revision := tail[1]
 	switch tail[0] {
 	case "commit":
-		if !s.requireScope(w, r, auth.ScopeWrite) {
+		if _, ok := s.requireRepoScope(w, r, auth.ScopeWrite, repo); !ok {
 			return
 		}
 		s.handleCommit(w, r, repoType, repoID, revision)
 	case "preupload":
-		if !s.requireScope(w, r, auth.ScopeWrite) {
+		if _, ok := s.requireRepoScope(w, r, auth.ScopeWrite, repo); !ok {
 			return
 		}
 		s.handlePreupload(w, r)
 	case "branch":
-		if !s.requireScope(w, r, auth.ScopeWrite) {
+		if _, ok := s.requireRepoScope(w, r, auth.ScopeWrite, repo); !ok {
 			return
 		}
 		// tail[1] here is the branch name being created, not a revision to
@@ -398,7 +419,7 @@ func (s *Server) handleResolveDispatch(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireScope(w, r, auth.ScopeRead) {
+	if _, ok := s.requireRepoScope(w, r, auth.ScopeRead, auth.Repo{Type: repoType, ID: repoID}); !ok {
 		return
 	}
 	s.handleResolve(w, r, repoType, repoID, revision, filename)

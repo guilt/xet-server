@@ -23,6 +23,13 @@ sent. Passing -auth-token to xetd or xet is what opts into enforcement/sending
 a credential - existing deployments and scripts that never pass that flag see no
 behavior change at all.
 
+CONSTANTS
+
+const SharedSecretSubject = "shared-secret"
+    SharedSecretSubject is the Subject reported for a request that authenticated
+    with the raw shared secret and no user name.
+
+
 VARIABLES
 
 var ErrForbidden = errors.New("auth: principal lacks required scope")
@@ -43,6 +50,20 @@ var ErrUnauthenticated = errors.New("auth: request is not authenticated")
 
 
 FUNCTIONS
+
+func AllowsRepo(p Principal, repo Repo) bool
+    AllowsRepo reports whether p may act on repo. A repo-scoped principal
+    must match repo exactly; an unrestricted principal (shared secret, NoAuth,
+    StaticTokenAuth, custom) may act on any repo.
+
+func AllowsRepoCreate(p Principal, repo Repo) bool
+    AllowsRepoCreate reports whether p may create repo. Repo creation is the one
+    operation whose target cannot already be covered by the token's own repo,
+    so the rule is deliberately weaker than AllowsRepo: a repo-scoped write
+    credential may create a new repo only inside its own namespace ("alice/sec"
+    may create "alice/new"); creating in any other namespace requires the shared
+    secret's admin scope. This stops a token minted for one repo from populating
+    another owner's namespace.
 
 func BearerToken(r *http.Request) string
     BearerToken extracts the token from an incoming request's "Authorization:
@@ -176,6 +197,40 @@ type Principal interface {
     methods so a minimal custom implementation (e.g. "this token maps to this
     one hardcoded scope set") costs almost nothing to write.
 
+type Repo struct {
+	Type string
+	ID   string
+}
+    Repo identifies one repository a credential is scoped to. Type is
+    the singular Hub repo type ("model", "dataset", "space") and ID is
+    "{namespace}/{name}" - the same values the Hub routes parse out of their
+    paths. The zero Repo means "not restricted to a repository": the shared
+    secret, auth.NoAuth, and a custom Authenticator that does not implement
+    RepoScopedPrincipal all behave that way.
+
+func RepoOf(p Principal) Repo
+    RepoOf returns p's repo restriction, or the zero Repo when p is not
+    repo-scoped.
+
+func (r Repo) IsZero() bool
+
+func (r Repo) Namespace() string
+    Namespace returns the owner part of ID ("alice" for "alice/model"). An ID
+    with no slash is its own namespace.
+
+func (r Repo) String() string
+
+type RepoScopedPrincipal interface {
+	Principal
+	Repo() Repo
+}
+    RepoScopedPrincipal is implemented by a Principal whose credential is bound
+    to exactly one repository - what SignedTokenAuth returns for a minted token.
+    A Principal that does NOT implement it (the shared secret, auth.NoAuth,
+    StaticTokenAuth) is unrestricted by repo; AllowsRepo treats it as valid for
+    every repo, preserving the behavior of custom Authenticators that predate
+    repo scoping.
+
 type Scope string
     Scope identifies a capability a Principal may or may not hold. Kept as
     a plain string type (not a closed enum) so a custom Authenticator can
@@ -191,7 +246,69 @@ const (
 	// upload, commit, repo create) - mirrors the real protocol's `write`
 	// scope.
 	ScopeWrite Scope = "write"
+	// ScopeAdmin gates this project's own operator routes that destroy
+	// data (garbage collection). Not part of the real protocol: no
+	// minted token ever carries it, only the operator's shared secret
+	// itself (SignedTokenAuth) or a deployment with no auth at all
+	// (NoAuth, where every scope is granted).
+	ScopeAdmin Scope = "admin"
 )
+type SignedTokenAuth struct {
+	// Has unexported fields.
+}
+    SignedTokenAuth is the Authenticator a deployment with one shared secret
+    should use when the Hub shim and the CAS run as a pair. It accepts three
+    credential shapes:
+
+      - Authorization: Bearer <secret> - the operator's shared secret, every
+        scope (what StaticTokenAuth accepts).
+      - Authorization: Basic <user>:<secret> - the same secret sent the only way
+        git-lfs can send a credential (HTTP Basic, via git's credential helper).
+        The user part becomes the Principal's Subject, which is what names the
+        owner of a git-lfs lock.
+      - Authorization: Bearer <minted token> - a token this same secret minted
+        via MintToken: HMAC-signed, scoped (read or write), bound to a subject,
+        expiring, and scoped to one repository. This is what the Hub shim hands
+        to hf_xet / git-xet for the CAS, and what it puts on git-lfs download
+        hrefs. Also accepted as the password of a Basic credential, since some
+        clients can only send Basic.
+
+    The repository binding is part of the MAC, not a separate check:
+    a token minted for alice/one cannot be edited into one for bob/two, and Hub
+    routes reject it when the repo in the URL does not match (see AllowsRepo).
+    Tokens minted before this field existed (xst1) are refused outright rather
+    than accepted unscoped.
+
+    Minted tokens are stateless: any process holding the secret can verify one,
+    so a CAS and a Hub shim in separate processes (or a restarted one) agree
+    without sharing state. StaticTokenAuth stays as the plain single-secret
+    Authenticator for deployments that never mint anything.
+
+func NewSignedTokenAuth(secret string) *SignedTokenAuth
+    NewSignedTokenAuth constructs a SignedTokenAuth around secret, which must be
+    non-empty (see NewStaticTokenAuth for why an empty secret is refused rather
+    than silently accepted).
+
+func (a *SignedTokenAuth) Authenticate(r *http.Request) (Principal, error)
+    Authenticate implements Authenticator; see the type's doc comment for the
+    three accepted credential shapes.
+
+func (a *SignedTokenAuth) MintToken(scope Scope, subject string, repo Repo, ttl time.Duration) (string, time.Time, error)
+    MintToken implements TokenMinter. Layout (dot-separated, every field free of
+    dots by construction - repo type/id are hex-encoded):
+
+        xst2.<exp unix seconds>.<scope>.<hex(subject)>.<hex(repo type)>.<hex(repo id)>.<hex(HMAC-SHA256)>
+
+    The MAC covers the prefix, expiry, scope, subject, repo type, and repo ID,
+    so none of them can be altered without the secret. A zero repo produces the
+    empty strings in the two repo fields; that shape is only used for the URL
+    token the CAS mints when the caller authenticated with the shared secret
+    itself (which is already unrestricted).
+
+func (a *SignedTokenAuth) VerifyURLToken(token string) (Principal, error)
+    VerifyURLToken implements URLTokenVerifier: a minted token is as good in a
+    URL as in a header, since it already carries its scope, subject and expiry.
+
 type StaticTokenAuth struct {
 	// Has unexported fields.
 }
@@ -214,4 +331,28 @@ func NewStaticTokenAuth(token string) *StaticTokenAuth
     no enforcement is wanted.
 
 func (a *StaticTokenAuth) Authenticate(r *http.Request) (Principal, error)
+
+type TokenMinter interface {
+	// MintToken returns a token granting scope to subject for repo until
+	// exp. A zero repo mints an unscoped token; Hub routes always pass a
+	// real repo, and a minted token is rejected on any Hub route whose
+	// repo it does not match (see AllowsRepo).
+	MintToken(scope Scope, subject string, repo Repo, ttl time.Duration) (token string, exp time.Time, err error)
+}
+    TokenMinter issues short-lived bearer tokens carrying a scope, a subject,
+    and a repo binding. hubserver uses it to answer the xet-{read,write}-token
+    routes and to put a token into every git-lfs batch action it hands out,
+    so the CAS side can authenticate those requests without the client ever
+    seeing the operator's shared secret.
+
+type URLTokenVerifier interface {
+	VerifyURLToken(token string) (Principal, error)
+}
+    URLTokenVerifier is implemented by an Authenticator that accepts a minted
+    token carried in a URL's query string instead of a header: the credential
+    of a presigned-style download URL. xet-core fetches the xorb URLs in a
+    reconstruction response with no Authorization header (on the real Hub they
+    are presigned CDN URLs), so a CAS whose storage backend cannot presign signs
+    its own byte-serving URLs this way. Only casserver's xorb GET/HEAD routes
+    consult it; nothing else accepts a credential from a URL.
 ```

@@ -53,8 +53,20 @@ const (
 	V1 = "/v1"
 	V2 = "/v2"
 
-	XorbsPath             = V1 + "/xorbs/{prefix}/{hash}"
-	ShardsPath            = V1 + "/shards"
+	XorbsPath  = V1 + "/xorbs/{prefix}/{hash}"
+	ShardsPath = V1 + "/shards"
+	// ShardsPathUnversioned is where xet-core >= 1.5 (git-xet 0.2, recent
+	// hf_xet) POSTs shards: cas_client/src/remote_client.rs builds
+	// "{endpoint}/shards" with no version segment, while the openapi
+	// spec still documents /v1/shards. Both are served identically;
+	// cmd/xetd mounts this one at the root of the CAS mux.
+	ShardsPathUnversioned = "/shards"
+	// Deliberately NOT served: POST /v2/shards. Current hf_xet tries it
+	// first, but v2 is a different protocol - the response is a stream
+	// of newline-delimited JSON progress frames with a "type" field, and
+	// the v1 body {"result":1} makes the client fail with "failed to
+	// parse shard upload progress frame". A 404 there makes it fall back
+	// to the v1 path, which is what this server speaks (PROTOCOL.md #16).
 	ReconstructionsPath   = V1 + "/reconstructions/{file_id}"
 	ReconstructionsPathV2 = V2 + "/reconstructions/{file_id}"
 	ChunksPath            = V1 + "/chunks/{prefix}/{hash}"
@@ -74,13 +86,49 @@ const (
     client) uses the same named constant instead of a duplicated string literal.
     ReconstructionsPathV2 is the V2 counterpart of ReconstructionsPath.
 
+const ClientShardCacheLifetime = 21 * 24 * time.Hour
+    ClientShardCacheLifetime is how long a xet client keeps the shards
+    of its own uploads in its cache and dedups against them without
+    asking the server: MDB_SHARD_LOCAL_CACHE_EXPIRATION in xet-core's
+    xet_data/src/processing/constants.rs (3 weeks, as of xet-core 1.6).
+
+const DefaultGCGrace = ClientShardCacheLifetime + 24*time.Hour
+    DefaultGCGrace is the grace period Collect applies when the request does
+    not name one: the client cache lifetime plus a day of margin for clock
+    differences and a push that started just before the cutoff.
+
+const GCPath = V1 + "/gc"
+    GCPath is where cmd/xetd mounts GCHandler on the CAS port. It is not
+    registered by Server.routes on purpose: a Server embedded in xet-proxyd is
+    a cache and must never get a route that deletes by keep set, so only the
+    standalone binary wires it.
+
 
 VARIABLES
+
+var ErrContentUnavailable = errors.New("casserver: content not yet available on this replica")
+    ErrContentUnavailable is returned (via errors.Is) by ReconstructFile and
+    reported by MissingXorbs when a file's shard is known but at least one xorb
+    it references is not in this replica's store yet. On a synced folder that is
+    the normal state of a file another machine pushed moments ago; the caller
+    should ask the client to retry.
+
+var ErrGCUnsupported = errors.New("casserver: storage backend cannot enumerate and delete blobs")
+    ErrGCUnsupported is returned by Collect when the storage backend cannot
+    enumerate and delete its blobs (s3store today).
 
 var ErrMalformedXorb = errors.New("casserver: malformed xorb")
     ErrMalformedXorb is returned (wrapped) by IngestXorb when r's bytes don't
     parse as a valid chunk stream (see xorbformat.DeriveFooter) - maps to a 400
     at handleUploadXorb's HTTP boundary.
+
+var ErrRangeNotSatisfiable = errors.New("casserver: range not satisfiable")
+    ErrRangeNotSatisfiable is returned (via errors.Is) by ReconstructFile when
+    [start, end] falls outside the file.
+
+var ErrUnknownFile = errors.New("casserver: unknown file")
+    ErrUnknownFile is returned (via errors.Is) by ReconstructFile when no
+    uploaded shard has described fileHash.
 
 var ErrXorbHashMismatch = errors.New("casserver: xorb hash in URL does not match hash computed from chunk contents")
     ErrXorbHashMismatch is returned (wrapped) by IngestXorb when claimedHash
@@ -89,6 +137,86 @@ var ErrXorbHashMismatch = errors.New("casserver: xorb hash in URL does not match
 
 
 TYPES
+
+type GCHandlerConfig struct {
+	// DefaultGrace applies when the request names none.
+	DefaultGrace time.Duration
+	// ExtraKeep, if set, returns OIDs to keep in every run regardless
+	// of the request (the Hub shim's file registry).
+	ExtraKeep func() []string
+	// AfterCollect, if set, runs after a collection that was not a dry
+	// run: the place to snapshot. Its error is reported in the
+	// response but the collection stands.
+	AfterCollect func() error
+	// Disabled, if non-empty, makes every request fail with 409 and
+	// this reason (synced-folder mode).
+	Disabled string
+}
+    GCHandlerConfig wires the parts of a collection that live outside this
+    package.
+
+type GCOptions struct {
+	// Keep lists the hex SHA-256 of every file to keep, as git-lfs names
+	// them (the OID in the pointer). Case-insensitive. An OID no shard
+	// describes is counted in the report, not an error: it may be a
+	// pointer whose object was never pushed, or one still in transit.
+	Keep []string
+	// Grace protects any xorb uploaded, fetched or advertised more
+	// recently than this, and any xorb file that recently changed on
+	// disk, from deletion in this run. Zero means no grace; see the
+	// file comment before passing less than DefaultGCGrace.
+	Grace time.Duration
+	// DryRun computes and reports everything and changes nothing.
+	DryRun bool
+}
+    GCOptions is one collection's input.
+
+type GCReport struct {
+	DryRun       bool  `json:"dry_run"`
+	GraceSeconds int64 `json:"grace_seconds"`
+
+	// KeepOIDs is how many distinct OIDs the keep set had; KeepUnknown
+	// how many of them no shard describes (sample in KeepUnknownSample).
+	KeepOIDs          int      `json:"keep_oids"`
+	KeepUnknown       int      `json:"keep_unknown"`
+	KeepUnknownSample []string `json:"keep_unknown_sample,omitempty"`
+
+	// FilesKept counts every file that stays; FilesRecent is the part of
+	// it kept only because its shard arrived inside the grace period (a
+	// push whose pointer the keep list could not name yet).
+	FilesKept    int `json:"files_kept"`
+	FilesRecent  int `json:"files_recent"`
+	FilesDropped int `json:"files_dropped"`
+
+	ShardsKept      int `json:"shards_kept"`
+	ShardsRewritten int `json:"shards_rewritten"`
+	ShardsDeleted   int `json:"shards_deleted"`
+
+	// XorbsKept are referenced by a kept file. XorbsDeleted were not and
+	// are gone (or, in a dry run, would be). XorbsDeferred were not
+	// referenced either but are inside the grace period or being
+	// fetched right now; a later run reconsiders them.
+	XorbsKept          int   `json:"xorbs_kept"`
+	XorbsKeptBytes     int64 `json:"xorbs_kept_bytes"`
+	XorbsDeleted       int   `json:"xorbs_deleted"`
+	XorbsDeletedBytes  int64 `json:"xorbs_deleted_bytes"`
+	XorbsDeferred      int   `json:"xorbs_deferred"`
+	XorbsDeferredBytes int64 `json:"xorbs_deferred_bytes"`
+
+	// Errors are per-item failures (a xorb that could not be deleted, a
+	// shard that could not be parsed) that did not stop the run.
+	Errors []string `json:"errors,omitempty"`
+}
+    GCReport is what one collection did, or (DryRun) would do.
+
+type GCRequest struct {
+	Keep []string `json:"keep"`
+	// GraceSeconds overrides the server's default grace when present
+	// (0 is "no grace"; see the file comment).
+	GraceSeconds *int64 `json:"grace_seconds,omitempty"`
+	DryRun       bool   `json:"dry_run"`
+}
+    GCRequest is POST GCPath's JSON body.
 
 type Server struct {
 	// Has unexported fields.
@@ -114,6 +242,14 @@ type Server struct {
 
 func New(xorbs storage.Store) *Server
 
+func (s *Server) Collect(ctx context.Context, opts GCOptions) (GCReport, error)
+    Collect runs one garbage collection: see the file comment for what it keeps
+    and deletes and why. Safe to call on a serving server; uploads and shard
+    scans wait while the index is rebuilt (a few seconds for a large index),
+    downloads do not. The caller should snapshot right after a run that changed
+    anything (GCHandlerConfig.AfterCollect), so a crash cannot restore an index
+    that still advertises deleted xorbs.
+
 func (s *Server) EvictionCandidates() []eviction.Candidate
     EvictionCandidates implements eviction.Registry: every xorb this server
     knows about, excluding any with a fetch currently in progress. Called by
@@ -130,6 +266,12 @@ func (s *Server) ForgetKey(key string)
     uploaded - a client that still needs it must re-upload (real Xet clients
     already handle a missing xorb by re-deriving it from the source file,
     since CAS storage is explicitly not guaranteed permanent).
+
+func (s *Server) GCHandler(cfg GCHandlerConfig) http.Handler
+    GCHandler serves POST GCPath: Collect with the request's keep set
+    plus cfg.ExtraKeep, answering with the GCReport as JSON. Requires
+    auth.ScopeAdmin, which only the operator's shared secret carries (or every
+    request, with no auth configured).
 
 func (s *Server) HasFileRecon(fileID merklehash.Hash) bool
     HasFileRecon reports whether this server already has a complete
@@ -204,6 +346,38 @@ func (s *Server) LoadSnapshot(path string) error
     prior snapshot); any other read/parse failure is returned so the caller can
     decide whether to start fresh or abort startup.
 
+func (s *Server) MissingXorbs(ctx context.Context, fileHash merklehash.Hash) ([]merklehash.Hash, error)
+    MissingXorbs reports which xorbs the file identified by fileHash needs that
+    this replica does not have (or has only partially, from a sync in progress).
+    ErrUnknownFile if no shard describes the file. An empty result means
+    ReconstructFile can serve the whole file now.
+
+func (s *Server) ReconstructFile(ctx context.Context, fileHash merklehash.Hash, start, end int64, w io.Writer) error
+    ReconstructFile writes bytes [start, end] (inclusive, like an HTTP Range) of
+    the file identified by fileHash to w, decompressing each chunk from its xorb
+    on the way out. A zero-length file is served for start == 0 and end == -1
+    only. Every xorb touched is marked in flight for the duration so an eviction
+    sweep cannot delete it mid-stream.
+
+    The write to w may have started when an error is returned (a xorb missing
+    from storage, a corrupt chunk), so a caller streaming an HTTP body cannot
+    turn a late error into a clean status code; it should log it and drop the
+    connection, and the client's own SHA-256 check (git-lfs verifies every
+    download) catches the truncation.
+
+func (s *Server) RunRescanLoop(ctx context.Context, interval time.Duration)
+    RunRescanLoop calls ScanShards every interval until ctx is done. For a
+    replica on a synced folder this is how it notices other machines' uploads
+    before any client asks for them (so their chunks take part in dedup on the
+    next push here).
+
+func (s *Server) ScanShards(ctx context.Context) (added int, err error)
+    ScanShards indexes every shard file in the shard dir that this server has
+    not indexed yet. A file is only trusted if its content hashes to its name:
+    a sync tool's half-delivered file (or anything else in the directory) fails
+    that check and is skipped until a later scan sees it whole. Returns how many
+    shards were newly indexed. Safe to call concurrently with requests.
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) SetAuthenticator(a auth.Authenticator)
@@ -219,12 +393,31 @@ func (s *Server) SetEvictionStats(statsFunc func() eviction.Stats)
     running server rather than only inferable from logs. Call once at startup if
     an eviction.Sweeper was created for this server's store.
 
+func (s *Server) SetFetchURLSigner(m auth.TokenMinter, ttl time.Duration)
+    SetFetchURLSigner makes the xorb fetch URLs in reconstruction responses
+    carry a read token minted by m for the requesting principal, valid for ttl,
+    whenever the storage backend cannot presign. Needed as soon as auth is on:
+    xet-core fetches those URLs with no Authorization header (the real CAS
+    hands out presigned CDN URLs), so without a credential in the URL every
+    hf download failed with 401 while git-lfs downloads, whose batch actions
+    carry a header, worked. The same SignedTokenAuth that authenticates requests
+    serves as m.
+
+func (s *Server) SetShardDir(dir string) error
+    SetShardDir makes s persist every ingested shard body to dir (named by the
+    shard's content hash) and rescan dir for shards written by other replicas.
+    Call before the first request. It does not scan by itself; call ScanShards
+    once after any snapshot has been loaded.
+
 func (s *Server) SetUploadRateLimiter(limiter *ratelimit.Limiter)
     SetUploadRateLimiter wires a per-source-IP token-bucket limiter in front
     of the xorb and shard upload endpoints. Must be called before serving any
     traffic - it rebuilds the route table (http.ServeMux panics on duplicate
     pattern registration, so routes are re-registered from scratch on a fresh
     mux rather than layered on top of the existing one).
+
+func (s *Server) ShardDir() string
+    ShardDir returns the directory set by SetShardDir, or "".
 
 func (s *Server) Snapshot(path string) error
     Snapshot serializes s's persistable indices to path via the same

@@ -202,7 +202,7 @@ func (s *Server) xorbFetchURL(ctx context.Context, xorbHash merklehash.Hash, bas
 	u := fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, xorbPrefix, xorbHash.Hex())
 	if s.urlTokenMinter != nil {
 		if principal, ok := ctx.Value(principalKey{}).(auth.Principal); ok {
-			token, _, err := s.urlTokenMinter.MintToken(auth.ScopeRead, principal.Subject(), s.urlTokenTTL)
+			token, _, err := s.urlTokenMinter.MintToken(auth.ScopeRead, principal.Subject(), auth.RepoOf(principal), s.urlTokenTTL)
 			if err != nil {
 				return "", fmt.Errorf("sign xorb fetch url: %w", err)
 			}
@@ -239,9 +239,13 @@ func (s *Server) handleChunkDedup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	shardBytes, known := s.dedupAnswer(hash)
+	shardBytes, known, err := s.dedupAnswer(hash)
 	if !known && s.rescanOnMiss() {
-		shardBytes, known = s.dedupAnswer(hash)
+		shardBytes, known, err = s.dedupAnswer(hash)
+	}
+	if err != nil {
+		httpError(w, "build dedup answer: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 	if !known || shardBytes == nil {
 		// !known: no uploaded shard has ever referenced this chunk.

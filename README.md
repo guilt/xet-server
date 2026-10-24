@@ -236,6 +236,14 @@ reconstructions/resolve need read) the same way real Xet/HF Hub tokens
 work. `-auth-token None` (the default) or leaving it unset disables
 enforcement entirely.
 
+Minted tokens (the short-lived credentials the Hub shim issues to `hf_xet`
+and git-xet, and puts on git-lfs download links) are also **bound to one
+repository**: the repo type and ID are inside the HMAC-signed payload, so a
+token for `alice/one` gets `403` on `bob/two`'s read, write, and token-refresh
+routes. A repo-scoped write token may create a new repo only inside its own
+namespace; creating under another owner requires the shared secret. The
+shared secret itself stays unrestricted (it carries the `admin` scope).
+
 ```bash
 export XETD_AUTH_TOKEN="a-long-random-secret"
 ./bin/xetd -addr :8420 -hub-addr :8421 -data ./xet-data
@@ -469,26 +477,30 @@ directory, and download again with nothing else running. This is `xet-proxyd`'s
 whole reason to exist: a practical path off huggingface.co, not just a
 faster mirror of it.
 
-> **Caching is best-effort, and against the real huggingface.co it is
-> often partial.** A xorb is cached only when the proxy can verify the
-> bytes it fetched against that xorb's content hash. A file's
-> reconstruction `fetch_info` gives the byte ranges *that file* needs,
-> which for a deduplicated repo is frequently only part of a xorb
-> originally written for some other file (e.g. chunks 15-21 of 1042).
-> Those bytes cannot reproduce the whole xorb's hash, so they are
-> rejected rather than stored under a hash they don't match. The download
-> still succeeds (the proxy relays upstream's reconstruction and the
-> client fetches from the CDN directly) but nothing is cached for that
-> file, and the proxy logs
-> `WARN proxycas: reconstruction cache-ingest failed, falling back to live relay`.
+> **Partial xorb slices are cached too.** A file's reconstruction
+> `fetch_info` gives the byte ranges *that file* needs, which for a
+> deduplicated repo is frequently only part of a xorb originally written
+> for some other file (e.g. chunks 15-21 of 1042). Those bytes cannot
+> reproduce the original xorb's hash, so the proxy does not store them
+> under that hash. Instead it fetches the cited chunk group, repackages
+> those chunks as a new xorb under **its own** content hash, and rewrites
+> the file's terms to reference it. The cached file is complete,
+> hash-verifiable, and works offline after the handoff above - including
+> heavily deduplicated datasets.
 >
-> The sequence above is exact for content the proxy *did* cache - which
-> is what the integration test covers, since a local stand-in Hub has no
-> cross-repo dedup and therefore hands out whole-xorb ranges. If you need
-> a guaranteed-complete offline library rather than an opportunistic
-> cache, use the download-then-upload approach in
-> [MIRRORING.md section 10](docs/MIRRORING.md): the upload path chunks
-> local files itself and always writes whole xorbs.
+> A file still falls back to a live relay if `fetch_info` leaves a gap in
+> a term's coverage (an incomplete/malformed upstream response): the
+> download succeeds from the CDN, but that file is not cached. The proxy
+> logs that at `DEBUG` (`proxycas: file not cacheable...`). Non-Xet blobs
+> relayed live are likewise not cached; for a library that includes those,
+> see the download-then-upload approach in
+> [MIRRORING.md section 10](docs/MIRRORING.md).
+>
+> This was verified against the real Hub with a `bigcode/the-stack-v2`
+> file whose reconstruction cites only a 222-chunk slice of a shared
+> xorb: online download through the proxy, then a plain `xetd` on the
+> same `-data` directory with no upstream, produced a byte-identical
+> SHA-256.
 
 # HTTP API
 

@@ -16,6 +16,13 @@ chunk) mapping a truncated hash to an index into the corresponding content
 section, then the footer (read from the end of the file, since it carries the
 offsets needed to find everything else).
 
+CONSTANTS
+
+const NoExpiry = ^uint64(0)
+    NoExpiry is the ShardKeyExpiry of a shard that never expires: what a client
+    writes for its own shards, and what WriteShard uses.
+
+
 FUNCTIONS
 
 func LookupByKey[E interface{ GetKey() uint64 }](entries []E, key uint64) []E
@@ -166,11 +173,30 @@ type Footer struct {
 func ReadFooter(r io.Reader) (Footer, error)
     ReadFooter reads a fixed-size footer from r.
 
+func WriteKeyedShardExpiring(w io.Writer, xorbs []XorbEntry, key merklehash.Hash, expiry uint64) (Footer, error)
+    WriteKeyedShardExpiring serializes an xorb-only shard whose chunk hashes
+    are keyed with key, matching xet-core's MDBShardInfo::export_as_keyed_shard
+    (DataHash::hmac, the same BLAKE3 keyed hash this package's merklehash
+    exposes as Hash.HMAC). The client computes the same keyed hash for each
+    chunk it already holds, so it can only match chunks in a response if it has
+    the shard's random key. key must be non-zero: a zero key would advertise raw
+    chunk hashes to every caller, which is the exact leak this function exists
+    to avoid.
+
 func WriteShard(w io.Writer, files []FileEntry, xorbs []XorbEntry) (Footer, error)
     WriteShard serializes files/xorbs into a complete shard file, mirroring
     MDBShardInfo::serialize_from's section order: header, file-info section
     (+ bookend), xorb-info section (+ bookend), file lookup table, xorb lookup
     table, chunk lookup table, footer.
+
+func WriteShardExpiring(w io.Writer, files []FileEntry, xorbs []XorbEntry, expiry uint64) (Footer, error)
+    WriteShardExpiring is WriteShard with the footer's ShardKeyExpiry set to
+    expiry, a Unix time in seconds. A client's shard cache does not load a
+    shard past its expiry (MDBShardFile::load_managed_directory in xet-core
+    skips it, and deletes it a week later), so a server that hands out shards
+    in global-dedup answers uses this to bound how long a client may keep
+    deduplicating against them without asking again - the horizon a garbage
+    collector on that server has to respect.
 
 type Header struct {
 	Version    uint64

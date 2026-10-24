@@ -47,47 +47,50 @@ const lfsPathMarker = ".git/info/lfs"
 const lfsBatchPathSuffix = "/info/lfs/objects/batch"
 
 // splitLFSPath parses "[type/]{owner}/{name}.git/info/lfs[/{endpoint}]"
-// into repoID ("owner/name") and the endpoint after the marker (no
-// leading slash; "" for a bare lfs.url). ok is false when the two
-// segments before ".git" are not a usable owner/name.
-func splitLFSPath(rest string) (repoID, endpoint string, ok bool) {
+// into repoType ("model" for the unprefixed form), repoID ("owner/name"),
+// and the endpoint after the marker (no leading slash; "" for a bare
+// lfs.url). ok is false when the two segments before ".git" are not a
+// usable owner/name.
+func splitLFSPath(rest string) (repoType, repoID, endpoint string, ok bool) {
 	idx := strings.Index(rest, lfsPathMarker)
 	if idx < 0 {
-		return "", "", false
+		return "", "", "", false
 	}
 	head := rest[:idx]
 	parts := strings.Split(head, "/")
 	if len(parts) < 2 {
-		return "", "", false
+		return "", "", "", false
 	}
 	owner, name := parts[len(parts)-2], parts[len(parts)-1]
 	if owner == "" || name == "" {
-		return "", "", false
+		return "", "", "", false
 	}
+	repoType = repoTypeFromPrefix(parts[:len(parts)-2])
 	endpoint = strings.TrimPrefix(rest[idx+len(lfsPathMarker):], "/")
-	return owner + "/" + name, endpoint, true
+	return repoType, owner + "/" + name, endpoint, true
 }
 
 // handleLFS dispatches every request whose path carries lfsPathMarker.
 func (s *Server) handleLFS(w http.ResponseWriter, r *http.Request, rest string) {
-	repoID, endpoint, ok := splitLFSPath(rest)
+	repoType, repoID, endpoint, ok := splitLFSPath(rest)
 	if !ok {
 		lfsError(w, "malformed repo id in LFS URL: want {owner}/{name}.git/info/lfs", http.StatusBadRequest)
 		return
 	}
+	repo := auth.Repo{Type: repoType, ID: repoID}
 	switch {
 	case endpoint == "objects/batch":
-		s.handleLFSBatch(w, r, repoID)
+		s.handleLFSBatch(w, r, repo)
 	case strings.HasPrefix(endpoint, "objects/"):
 		oid := strings.TrimPrefix(endpoint, "objects/")
-		s.handleLFSObject(w, r, repoID, oid)
+		s.handleLFSObject(w, r, repo, oid)
 	case endpoint == "locks":
-		s.handleLFSLocks(w, r, repoID)
+		s.handleLFSLocks(w, r, repo)
 	case endpoint == "locks/verify":
-		s.handleLFSLocksVerify(w, r, repoID)
+		s.handleLFSLocksVerify(w, r, repo)
 	case strings.HasPrefix(endpoint, "locks/") && strings.HasSuffix(endpoint, "/unlock"):
 		id := strings.TrimSuffix(strings.TrimPrefix(endpoint, "locks/"), "/unlock")
-		s.handleLFSUnlock(w, r, repoID, id)
+		s.handleLFSUnlock(w, r, repo, id)
 	default:
 		lfsError(w, "unknown LFS endpoint", http.StatusNotFound)
 	}
@@ -123,7 +126,7 @@ func writeLFSJSON(w http.ResponseWriter, code int, v any) {
 
 // lfsAuthenticate is authenticate with git-lfs shaped failures: the same
 // 401/403 split, but a {"message"} body and an LFS-Authenticate challenge.
-func (s *Server) lfsAuthenticate(w http.ResponseWriter, r *http.Request, scope auth.Scope) (auth.Principal, bool) {
+func (s *Server) lfsAuthenticate(w http.ResponseWriter, r *http.Request, scope auth.Scope, repo auth.Repo) (auth.Principal, bool) {
 	principal, err := s.authenticator.Authenticate(r)
 	if err != nil {
 		if errors.Is(err, auth.ErrUnauthenticated) {
@@ -135,6 +138,10 @@ func (s *Server) lfsAuthenticate(w http.ResponseWriter, r *http.Request, scope a
 	}
 	if !principal.HasScope(scope) {
 		lfsError(w, "credential lacks "+string(scope)+" access to this repository", http.StatusForbidden)
+		return nil, false
+	}
+	if !auth.AllowsRepo(principal, repo) {
+		lfsError(w, "credential is not scoped to repository "+repo.String(), http.StatusForbidden)
 		return nil, false
 	}
 	return principal, true

@@ -128,45 +128,51 @@ one of those calls (`proxyhub.Server.UpstreamCASBaseURL`). A request to
 the CAS-facing port before the Hub-facing port has relayed any traffic at
 all gets a `503`, not a hang or a silent wrong answer.
 
-### Caching is best-effort: the partial-xorb constraint
+### Partial-xorb slices become synthetic xorbs
 
-The "hand the directory to a plain `xetd`" story above holds for
-everything the proxy actually cached - but against the real Hub that is
-routinely a subset of what was downloaded, and the reason is structural
-rather than a bug to fix in the caching code.
-
-A xorb is only cached when the proxy can verify the fetched bytes against
-that xorb's content hash, since storing them under a hash they don't match
-would corrupt the cache. What a reconstruction hands back, though, are the
-byte ranges **the requested file needs** - and because Xet deduplicates
-across repos, a file frequently references xorbs originally written for
-other files and uses only the chunks it shares with them:
+A xorb is content-addressed over all of its chunks, but a reconstruction
+only cites the chunks **the requested file** needs. Because Xet
+deduplicates across repos, a file frequently references a xorb written
+for another file and uses only a slice of it:
 
 ```
 url_range = 1108398-1679278  (570,881 bytes)   chunk range = 15-21   # of 1042
 ```
 
 Chunks 15-21 of a 1042-chunk xorb cannot reproduce that xorb's hash, so
-`cacheXorbFromFetchInfo` fails and the xorb is skipped. Fetching the whole
-xorb instead isn't available either: the real CAS doesn't serve xorb
-bodies over `GET /v1/xorbs/` (its allow list is `HEAD,POST` - see
-PROTOCOL.md section 12.2), and the presigned URLs are scoped to exactly
-the ranges in `fetch_info`.
+they are never stored under the original hash. The real CAS doesn't serve
+whole xorb bodies over `GET /v1/xorbs/` (its allow list is `HEAD,POST`),
+and the presigned URLs are signature-scoped to exactly the ranges in
+`fetch_info`, so the slice cannot be widened either.
 
-When this happens `handleReconstructionCommon` logs at `WARN` and falls
-back to `relayReconstructionLive`, so the client still completes its
-download straight from the CDN - correctness and availability are
-preserved; only cache coverage is lost. Caching whole xorbs would require
-a different cache granularity (storing verified *chunk ranges* keyed by
-`(xorb, range)` and serving reconstructions from those), which is a
-larger change to the storage model than the current content-addressed
-xorb store.
+Instead, `proxycas` repackages the cited bytes. For each xorb, it merges
+adjacent/overlapping `fetch_info` ranges into contiguous chunk groups,
+fetches each group through its presigned URL(s), scans the chunk headers,
+and writes the exact chunks as a **new xorb** under the hash computed
+from them (`cachePartialGroup` / `fillPartialGroups`). The file's terms
+are rewritten to reference that synthetic xorb with chunk indexes
+relative to the group start. If a group happens to be the whole original
+xorb, the original hash is used and no rewrite cost is paid.
 
-The practical consequence: for a *guaranteed* complete offline library,
-seed via the upload path instead - `hf_xet` chunks the local file itself
-and always writes whole xorbs, so `IngestXorb` verifies cleanly. See
-[MIRRORING.md](MIRRORING.md) section 10.
+This has two important properties:
 
+- **No corruption is possible.** A hash is only ever stored alongside
+  bytes that reproduce it; a partial slice simply gets a different,
+  legitimate content hash.
+- **Offline handoff is complete for cached Xet files.** After the proxy
+  stops, a plain `xetd` on the same `-data` directory can serve the file
+  byte-for-byte with no upstream, because every term points at an xorb it
+  actually has. This covers dataset/dense-repo files whose xorb is shared
+  across thousands of other files.
+
+If `fetch_info` leaves a gap in a term's chunk coverage - an incomplete
+or malformed upstream response - that file still falls back to
+`relayReconstructionLive`: the download succeeds from the CDN, but the
+file is not cached. Synthetic xorbs duplicate shared chunks that the
+original xorb also contains; that is the storage cost of making
+deduplicated downloads handoff-safe. Non-Xet blobs relayed live are not
+cached at all; for a library that guarantees those too, seed via the
+upload path (see [MIRRORING.md](MIRRORING.md) section 10).
 ## Upload flow
 
 ```mermaid

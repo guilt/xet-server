@@ -259,7 +259,7 @@ func TestFolder_ChunkDedupSeesOtherReplicasShards(t *testing.T) {
 	_, xorbHash, chunkHashes := buildXorb(t, [][]byte{[]byte("chunk one on A"), []byte("chunk two on A")})
 	_ = xorbHash
 
-	if _, known := b.dedupAnswer(chunkHashes[0]); known {
+	if _, known, _ := b.dedupAnswer(chunkHashes[0]); known {
 		t.Fatal("B knows A's chunk before sync")
 	}
 	syncDir(t, dirA, dirB, "shards", nil)
@@ -268,7 +268,7 @@ func TestFolder_ChunkDedupSeesOtherReplicasShards(t *testing.T) {
 	if !b.rescanOnMiss() {
 		t.Fatal("rescanOnMiss found nothing after sync")
 	}
-	if _, known := b.dedupAnswer(chunkHashes[1]); !known {
+	if _, known, _ := b.dedupAnswer(chunkHashes[1]); !known {
 		t.Fatal("B does not offer A's chunk for dedup after sync")
 	}
 }
@@ -308,7 +308,7 @@ func TestDedupResponseIsACompleteShardFile(t *testing.T) {
 		t.Fatal("persisted shard is not the raw upload")
 	}
 	// ...but the dedup response is a complete shard file.
-	served, known := srv.dedupAnswer(chunkHashes[1])
+	served, known, _ := srv.dedupAnswer(chunkHashes[1])
 	if !known {
 		t.Fatal("chunk not indexed")
 	}
@@ -319,11 +319,30 @@ func TestDedupResponseIsACompleteShardFile(t *testing.T) {
 	if full.Header.FooterSize == 0 || full.Footer.Version != 1 || full.Footer.ChunkLookupNumEntry != 2 || len(full.Xorbs) != 1 || len(full.Files) != 0 {
 		t.Fatalf("served shard: footerSize=%d footer v%d chunkLookup=%d xorbs=%d files=%d", full.Header.FooterSize, full.Footer.Version, full.Footer.ChunkLookupNumEntry, len(full.Xorbs), len(full.Files))
 	}
-	// A restart that rescans the raw file serves the same complete form.
+	if full.Footer.ChunkHashHMACKey.IsZero() {
+		t.Fatal("served shard has a zero chunk-hash key")
+	}
+	for i, c := range full.Xorbs[0].Chunks {
+		if want := chunkHashes[i].HMAC(full.Footer.ChunkHashHMACKey); c.ChunkHash != want {
+			t.Fatalf("served chunk %d = %s, want keyed %s", i, c.ChunkHash.Hex()[:8], want.Hex()[:8])
+		}
+	}
+	// A restart that rescans the raw file serves the same complete form,
+	// with a fresh key (the response is random per query by design).
 	again := newFolderServer(t, filepath.Dir(srv.ShardDir()))
 	again.ScanShards(context.Background())
-	served2, _ := again.dedupAnswer(chunkHashes[0])
-	if !bytes.Equal(served, served2) {
-		t.Fatal("rescanned shard serves different bytes")
+	served2, known, _ := again.dedupAnswer(chunkHashes[0])
+	if !known {
+		t.Fatal("chunk not indexed after rescan")
+	}
+	full2, err := shardformat.ReadShard(bytes.NewReader(served2))
+	if err != nil {
+		t.Fatalf("rescanned served shard does not parse: %v", err)
+	}
+	if full2.Header.FooterSize == 0 || full2.Footer.Version != 1 || full2.Footer.ChunkHashHMACKey.IsZero() || len(full2.Files) != 0 {
+		t.Fatalf("rescanned served shard: footerSize=%d footer v%d keyZero=%v files=%d", full2.Header.FooterSize, full2.Footer.Version, full2.Footer.ChunkHashHMACKey.IsZero(), len(full2.Files))
+	}
+	if full2.Footer.ChunkHashHMACKey == full.Footer.ChunkHashHMACKey {
+		t.Fatal("two dedup responses reused the same key")
 	}
 }

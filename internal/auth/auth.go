@@ -23,6 +23,7 @@ package auth
 import (
 	"errors"
 	"net/http"
+	"strings"
 )
 
 // Scope identifies a capability a Principal may or may not hold. Kept as
@@ -62,6 +63,80 @@ type Principal interface {
 
 	// HasScope reports whether this Principal is authorized for scope.
 	HasScope(scope Scope) bool
+}
+
+// Repo identifies one repository a credential is scoped to. Type is the
+// singular Hub repo type ("model", "dataset", "space") and ID is
+// "{namespace}/{name}" - the same values the Hub routes parse out of their
+// paths. The zero Repo means "not restricted to a repository": the shared
+// secret, auth.NoAuth, and a custom Authenticator that does not implement
+// RepoScopedPrincipal all behave that way.
+type Repo struct {
+	Type string
+	ID   string
+}
+
+func (r Repo) IsZero() bool { return r.Type == "" && r.ID == "" }
+
+// Namespace returns the owner part of ID ("alice" for "alice/model").
+// An ID with no slash is its own namespace.
+func (r Repo) Namespace() string {
+	if i := strings.IndexByte(r.ID, '/'); i >= 0 {
+		return r.ID[:i]
+	}
+	return r.ID
+}
+
+func (r Repo) String() string { return r.Type + ":" + r.ID }
+
+// RepoScopedPrincipal is implemented by a Principal whose credential is
+// bound to exactly one repository - what SignedTokenAuth returns for a
+// minted token. A Principal that does NOT implement it (the shared secret,
+// auth.NoAuth, StaticTokenAuth) is unrestricted by repo; AllowsRepo treats
+// it as valid for every repo, preserving the behavior of custom
+// Authenticators that predate repo scoping.
+type RepoScopedPrincipal interface {
+	Principal
+	Repo() Repo
+}
+
+// RepoOf returns p's repo restriction, or the zero Repo when p is not
+// repo-scoped.
+func RepoOf(p Principal) Repo {
+	if rp, ok := p.(RepoScopedPrincipal); ok {
+		return rp.Repo()
+	}
+	return Repo{}
+}
+
+// AllowsRepo reports whether p may act on repo. A repo-scoped principal
+// must match repo exactly; an unrestricted principal (shared secret,
+// NoAuth, StaticTokenAuth, custom) may act on any repo.
+func AllowsRepo(p Principal, repo Repo) bool {
+	if p.HasScope(ScopeAdmin) {
+		return true
+	}
+	if rp, ok := p.(RepoScopedPrincipal); ok {
+		return !rp.Repo().IsZero() && rp.Repo() == repo
+	}
+	return true
+}
+
+// AllowsRepoCreate reports whether p may create repo. Repo creation is
+// the one operation whose target cannot already be covered by the
+// token's own repo, so the rule is deliberately weaker than AllowsRepo:
+// a repo-scoped write credential may create a new repo only inside its
+// own namespace ("alice/sec" may create "alice/new"); creating in any
+// other namespace requires the shared secret's admin scope. This stops a
+// token minted for one repo from populating another owner's namespace.
+func AllowsRepoCreate(p Principal, repo Repo) bool {
+	if p.HasScope(ScopeAdmin) {
+		return true
+	}
+	if rp, ok := p.(RepoScopedPrincipal); ok {
+		return rp.Repo().Namespace() != "" && rp.Repo().Namespace() == repo.Namespace()
+	}
+	return true
 }
 
 // ErrUnauthenticated is returned by Authenticate (via errors.Is) when the

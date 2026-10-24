@@ -112,7 +112,7 @@ const (
 // read token in the action header. Objects no shard has described get
 // the per-object 404 the spec asks for, which git-lfs reports as a
 // missing object rather than failing the whole batch.
-func (s *Server) handleLFSBatch(w http.ResponseWriter, r *http.Request, repoID string) {
+func (s *Server) handleLFSBatch(w http.ResponseWriter, r *http.Request, repo auth.Repo) {
 	if r.Method != http.MethodPost {
 		lfsError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -168,7 +168,7 @@ func (s *Server) handleLFSBatch(w http.ResponseWriter, r *http.Request, repoID s
 	// Authenticate only once the body is known to be a batch for a real
 	// operation, so the fuzz-facing bounds above never depend on auth
 	// state - but before any repo state is touched.
-	principal, ok := s.lfsAuthenticate(w, r, scope)
+	principal, ok := s.lfsAuthenticate(w, r, scope, repo)
 	if !ok {
 		return
 	}
@@ -178,7 +178,7 @@ func (s *Server) handleLFSBatch(w http.ResponseWriter, r *http.Request, repoID s
 	// first time any repo ID is seen, so doing it before validation would
 	// let a flood of malformed requests bearing random repo IDs grow the
 	// repos map without ever submitting a valid batch.
-	s.getOrCreateRepo("model", repoID)
+	s.getOrCreateRepo(repo.Type, repo.ID)
 
 	resp := lfsBatchResponse{
 		HashAlgo: "sha256",
@@ -189,9 +189,9 @@ func (s *Server) handleLFSBatch(w http.ResponseWriter, r *http.Request, repoID s
 	base := lfsBaseURL(r)
 	switch req.Operation {
 	case "upload":
-		s.fillUploadBatch(&resp, &req, repoID, base, principal.Subject())
+		s.fillUploadBatch(&resp, &req, repo, base, principal.Subject())
 	case "download":
-		s.fillDownloadBatch(r, &resp, &req, repoID, base, principal.Subject())
+		s.fillDownloadBatch(r, &resp, &req, repo, base, principal.Subject())
 	}
 	writeLFSJSON(w, http.StatusOK, resp)
 }
@@ -234,6 +234,16 @@ func offersTransfer(transfers []string, name string) bool {
 // revision segment of the token route; anything unparseable falls back
 // to the default revision, since this server keys nothing by branch on
 // the LFS path and the segment only has to be a valid revision name.
+// repoURLPath renders a repo for a URL: models keep the traditional bare
+// "{owner}/{name}" form, while other repo types carry their pluralized
+// prefix (the same shape resolve and /api/ URLs use).
+func repoURLPath(repo auth.Repo) string {
+	if repo.Type == "" || repo.Type == "model" {
+		return repo.ID
+	}
+	return repo.Type + "s/" + repo.ID
+}
+
 func branchFromRef(refName string) string {
 	branch := strings.TrimPrefix(refName, "refs/heads/")
 	if branch == "" || strings.ContainsAny(branch, "/ ") {
@@ -242,7 +252,7 @@ func branchFromRef(refName string) string {
 	return branch
 }
 
-func (s *Server) fillUploadBatch(resp *lfsBatchResponse, req *lfsBatchRequest, repoID, base, subject string) {
+func (s *Server) fillUploadBatch(resp *lfsBatchResponse, req *lfsBatchRequest, repo auth.Repo, base, subject string) {
 	xet := offersTransfer(req.Transfers, transferXet)
 	if xet {
 		resp.Transfer = transferXet
@@ -255,7 +265,7 @@ func (s *Server) fillUploadBatch(resp *lfsBatchResponse, req *lfsBatchRequest, r
 	// credential is valid for all of them.
 	var upload *lfsAction
 	if xet && len(req.Objects) > 0 {
-		token, exp, err := s.mintToken(auth.ScopeWrite, subject)
+		token, exp, err := s.mintToken(auth.ScopeWrite, subject, repo)
 		if err != nil {
 			for _, obj := range req.Objects {
 				resp.Objects = append(resp.Objects, lfsBatchObject{OID: obj.OID, Size: obj.Size,
@@ -270,7 +280,7 @@ func (s *Server) fillUploadBatch(resp *lfsBatchResponse, req *lfsBatchRequest, r
 		// X-Xet-Token-Expiration nears, so a short -token-ttl must not
 		// make git-lfs give up before the agent even starts.
 		upload = &lfsAction{
-			Href: base + "/api/models/" + repoID + "/xet-write-token/" + branchFromRef(req.Ref.Name),
+			Href: base + "/api/" + repo.Type + "s/" + repo.ID + "/xet-write-token/" + branchFromRef(req.Ref.Name),
 			Header: map[string]string{
 				headerXetCasURL:          s.CASBaseURL,
 				headerXetAccessToken:     token,
@@ -298,13 +308,13 @@ func (s *Server) fillUploadBatch(resp *lfsBatchResponse, req *lfsBatchRequest, r
 	}
 }
 
-func (s *Server) fillDownloadBatch(r *http.Request, resp *lfsBatchResponse, req *lfsBatchRequest, repoID, base, subject string) {
+func (s *Server) fillDownloadBatch(r *http.Request, resp *lfsBatchResponse, req *lfsBatchRequest, repo auth.Repo, base, subject string) {
 	resp.Transfer = transferBasic
 
 	var token string
 	var expiresIn int64
 	if len(req.Objects) > 0 {
-		t, exp, err := s.mintToken(auth.ScopeRead, subject)
+		t, exp, err := s.mintToken(auth.ScopeRead, subject, repo)
 		if err != nil {
 			for _, obj := range req.Objects {
 				resp.Objects = append(resp.Objects, lfsBatchObject{OID: obj.OID, Size: obj.Size,
@@ -341,7 +351,7 @@ func (s *Server) fillDownloadBatch(r *http.Request, resp *lfsBatchResponse, req 
 			out.Size = size
 			out.Authenticated = true
 			out.Actions = map[string]*lfsAction{"download": {
-				Href:      base + "/" + repoID + lfsPathMarker + "/objects/" + obj.OID,
+				Href:      base + "/" + repoURLPath(repo) + lfsPathMarker + "/objects/" + obj.OID,
 				Header:    map[string]string{"Authorization": "Bearer " + token},
 				ExpiresIn: expiresIn,
 			}}

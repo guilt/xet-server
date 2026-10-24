@@ -261,6 +261,31 @@ path, which pairs `X-Xet-Hash` with a `Link: rel="xet-auth"` or
 exactly, camelCase field names included) *in addition to* the `X-Xet-*`
 headers, so both call sites are satisfied.
 
+### Minted tokens are bound to one repository
+
+The token the Hub shim mints (and puts on git-lfs actions and signed
+xorb URLs) is not just `exp`/`scope`/`subject`: it also carries the repo
+type and ID, all inside the HMAC-SHA256 payload (`auth.SignedTokenAuth`,
+format `xst2`). A token minted for `alice/sec` cannot be edited into one
+for `bob/private`, and every Hub route that names a repo - token minting,
+repo info, tree, resolve, preupload, commit, branch, and all git-lfs
+batch/object/lock routes - rejects a mismatch with `403`
+(`auth.AllowsRepo`). The shared secret itself stays unrestricted (it has
+the `admin` scope), and a custom `Authenticator` that does not implement
+`auth.RepoScopedPrincipal` keeps its previous unrestricted behavior.
+
+Repo creation is the one route whose target is not already in the URL.
+A repo-scoped write token may create only inside its own namespace
+(`alice/sec` may create `alice/new`); creating in another namespace
+requires the shared secret (`auth.AllowsRepoCreate`). Tokens from the
+older unscoped `xst1` format are refused outright rather than accepted
+without a repo binding.
+
+The CAS API has no repo in its URLs - xorb and chunk identities are
+global and content-addressed - so it authenticates the credential and
+signed xorb URL tokens stay bound to the repo that requested them, while
+repo authorization for named content happens at the Hub boundary above.
+
 ## 7. Never trust a wire-format entry count enough to allocate it upfront
 
 Unlike sections 1-6, this isn't a case where the real client's behavior
@@ -390,18 +415,29 @@ This server's implementation (`casserver.handleUploadShard`,
 `handleChunkDedup`) mirrors that: every chunk hash referenced by any
 uploaded shard's xorb-info section is indexed against that shard's raw
 uploaded bytes (`Server.chunkHashToShard`), and a dedup query for a known
-chunk hash returns that shard - **rebuilt as a complete shard file**
-(`casserver.dedupShardBody`), not the uploaded bytes verbatim. The two
-are not the same format: an upload has its footer and lookup tables
-stripped (`read_shard_to_bytes_remove_footer`), while the client loads a
-dedup response with `MDBShardInfo::load_from_reader`, which seeks to a
-footer at EOF and requires footer version 1. Serving uploads back
-unchanged only ever appeared to work because a client that uploaded a
-shard dedups against its own local copy and never fetches it; the first
-push from a *second* machine failed with git-xet's "Expected footer
-version 1, got 0". The rebuilt shard leaves the HMAC key zero, so the
-client matches raw chunk hashes. A chunk hash no uploaded shard has
-ever referenced returns `404`.
+chunk hash returns a **complete shard file**, not the uploaded bytes
+verbatim. The two are not the same format: an upload has its footer and
+lookup tables stripped (`read_shard_to_bytes_remove_footer`), while the
+client loads a dedup response with `MDBShardInfo::load_from_reader`,
+which seeks to a footer at EOF and requires footer version 1. Serving
+uploads back unchanged only ever appeared to work because a client that
+uploaded a shard dedups against its own local copy and never fetches it;
+the first push from a *second* machine failed with git-xet's "Expected
+footer version 1, got 0". A chunk hash no uploaded shard has ever
+referenced returns `404`.
+
+The answer is also **keyed, with a fresh random 32-byte key per
+response** (`casserver.keyedDedupShard`,
+`shardformat.WriteKeyedShardExpiring`). Every chunk hash in the
+xorb-info and chunk-lookup sections is `DataHash::hmac(key)` - the same
+BLAKE3 keyed hash xet-core's `export_as_keyed_shard` uses - and the key
+goes in the footer's `chunk_hash_hmac_key`. A client keying each chunk it
+already holds with the footer key matches exactly those chunks; it learns
+nothing about raw hashes it does not have. Leaving the key zero (the
+pre-fix behavior) exposed the raw hash of every chunk in the matching
+xorbs, plus file hashes and reconstruction terms, to any caller holding
+one chunk. The answer carries no file-reconstruction entries at all:
+clients only need the xorb chunk lists for dedup.
 
 What the answer covers matters as much as its format. A client queries
 the first chunk of every file and then at most once per 256 chunks
@@ -615,12 +651,15 @@ The production CAS server's `/v1/xorbs/{prefix}/{hash}` endpoint answers
 and the reconstruction response covers only the byte ranges the **requested
 file** needs. For a normally-varying file that is the full xorb; for a
 globally-deduped/shared xorb only a slice (a file made entirely of one
-repeated chunk is the degenerate case - the proxy then cannot fully cache
-that xorb, which is inherent to the dedup model, not a proxy bug). This
-project's own `casserver` still serves `GET /v1/xorbs/` (its local
-integration stand-in role), so `proxycas.ensureFileReconCached` prefers the
-presigned URLs when `fetch_info` is present and falls back to the direct
-fetch otherwise.
+repeated chunk is the degenerate case). The proxy repackages each cited
+slice as a new xorb under its own content hash and rewrites the file's
+terms to reference it, so the slice is offline-capable without ever being
+stored under a hash it does not match - see ARCHITECTURE.md's partial-xorb
+section. If `fetch_info` does not cover every chunk a term cites, the
+proxy relays that file live instead of caching it. This project's own
+`casserver` still serves `GET /v1/xorbs/` (its local integration stand-in
+role), so `proxycas.ensureFileReconCached` prefers the presigned URLs when
+`fetch_info` is present and falls back to the direct fetch otherwise.
 
 ### 12.3 Every Hub/CAS write needs an explicit Content-Type
 

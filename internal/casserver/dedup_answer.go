@@ -2,6 +2,8 @@ package casserver
 
 import (
 	"bytes"
+	"crypto/rand"
+	"fmt"
 	"sort"
 	"time"
 
@@ -32,33 +34,40 @@ const maxDedupAnswerChunks = 1 << 16
 // got one answer covering two chunks and re-uploaded everything else,
 // with the file's other xorbs on the server the whole time.
 //
-// The stored shard is returned unchanged if its xorb-info does not list
-// the chunk (a shard indexed by an older build), so the answer is never
-// worse than before.
-func (s *Server) dedupAnswer(chunk merklehash.Hash) ([]byte, bool) {
+// Security: every answer is keyed with a fresh random 32-byte key and
+// carries no file-reconstruction entries. Chunk hashes in the stored
+// shards are the raw content hashes; serving them unkeyed let any caller
+// holding one chunk learn the raw hashes of every other chunk in the
+// matching xorbs (plus file hashes and reconstruction terms), enough to
+// reference content it never had. xet-core's export_as_keyed_shard does
+// the same: key each chunk hash with the response's random key and put
+// the key in the footer, so a client can only match chunks it already
+// holds (it computes the keyed hash locally).
+//
+// The stored shard's xorb-info is used if it lists the chunk; a shard
+// indexed by an older build that does not is still served xorb-only,
+// keyed, with this build's expiry and access bookkeeping.
+func (s *Server) dedupAnswer(chunk merklehash.Hash) ([]byte, bool, error) {
 	s.chunkDedupMu.RLock()
 	shardHash, known := s.chunkHashToShard[chunk]
 	body := s.shardBodies[shardHash]
 	s.chunkDedupMu.RUnlock()
 	if !known || body == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	parsed := map[merklehash.Hash]*shardformat.Shard{}
 	home, ok := s.xorbEntryForChunk(shardHash, body, chunk, parsed)
 	if !ok {
-		// A shard indexed by an older build: serve it whole, but with
-		// this build's expiry and access bookkeeping, since the client
-		// will dedup against every xorb it lists.
 		shard, parsedOK := parseMemo(shardHash, body, parsed)
 		if !parsedOK {
-			return body, true
+			return nil, false, nil
 		}
-		var buf bytes.Buffer
-		if _, err := shardformat.WriteShardExpiring(&buf, shard.Files, shard.Xorbs, dedupAnswerExpiry()); err != nil {
-			return body, true
+		answer, err := keyedDedupShard(shard.Xorbs)
+		if err != nil {
+			return nil, true, err
 		}
 		s.touchXorbs(shard.Xorbs)
-		return buf.Bytes(), true
+		return answer, true, nil
 	}
 
 	xorbs := []shardformat.XorbEntry{home}
@@ -80,12 +89,32 @@ func (s *Server) dedupAnswer(chunk merklehash.Hash) ([]byte, bool) {
 		total += len(entry.Chunks)
 	}
 
-	var buf bytes.Buffer
-	if _, err := shardformat.WriteShardExpiring(&buf, nil, xorbs, dedupAnswerExpiry()); err != nil {
-		return body, true
+	answer, err := keyedDedupShard(xorbs)
+	if err != nil {
+		return nil, true, err
 	}
 	s.touchXorbs(xorbs)
-	return buf.Bytes(), true
+	return answer, true, nil
+}
+
+// keyedDedupShard serializes xorbs as a complete, xorb-only shard whose
+// chunk hashes are protected by a fresh random key. The key is generated
+// per response - never reused, cached, or derived from content - so one
+// answer's key cannot be used to interpret another.
+func keyedDedupShard(xorbs []shardformat.XorbEntry) ([]byte, error) {
+	var keyBytes [32]byte
+	if _, err := rand.Read(keyBytes[:]); err != nil {
+		return nil, fmt.Errorf("generate dedup shard key: %w", err)
+	}
+	key, err := merklehash.FromRawBytes(keyBytes[:])
+	if err != nil {
+		return nil, fmt.Errorf("parse dedup shard key: %w", err)
+	}
+	var buf bytes.Buffer
+	if _, err := shardformat.WriteKeyedShardExpiring(&buf, xorbs, key, dedupAnswerExpiry()); err != nil {
+		return nil, fmt.Errorf("write keyed dedup shard: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // dedupAnswerExpiry is the ShardKeyExpiry written into every answer:

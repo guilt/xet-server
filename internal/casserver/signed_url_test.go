@@ -45,6 +45,8 @@ func writeFooterlessShard(w *bytes.Buffer, file shardformat.FileEntry, xorb shar
 
 const signedURLTestSecret = "signed-url-fixture-secret-not-a-real-credential"
 
+var signedURLTestRepo = auth.Repo{Type: "model", ID: "alice/signed-url-test"}
+
 // newSignedTestServer is a CAS with SignedTokenAuth and the fetch-URL
 // signer installed, as cmd/xetd wires them when -auth-token is set.
 func newSignedTestServer(t *testing.T, sign bool) (*httptest.Server, *auth.SignedTokenAuth) {
@@ -108,7 +110,7 @@ func uploadSignedFixture(t *testing.T, ts *httptest.Server) (merklehash.Hash, []
 func TestFetchURL_CarriesAReadTokenForTheCaller(t *testing.T) {
 	ts, signed := newSignedTestServer(t, true)
 	fileHash, blob := uploadSignedFixture(t, ts)
-	readToken, _, err := signed.MintToken(auth.ScopeRead, "carol", time.Minute)
+	readToken, _, err := signed.MintToken(auth.ScopeRead, "carol", signedURLTestRepo, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +148,9 @@ func TestFetchURL_CarriesAReadTokenForTheCaller(t *testing.T) {
 		if err != nil || principal.Subject() != "carol" || principal.HasScope(auth.ScopeWrite) {
 			t.Fatalf("%s url token: err=%v subject=%v; want a read-only token bound to the caller", version, err, principal)
 		}
+		if got := auth.RepoOf(principal); got != signedURLTestRepo {
+			t.Fatalf("%s url token repo = %v, want %v (the signed URL must stay bound to the repo that requested it)", version, got, signedURLTestRepo)
+		}
 
 		// Fetched exactly as the client does: no headers.
 		for _, method := range []string{"GET", "HEAD"} {
@@ -182,7 +187,7 @@ func TestFetchURL_CarriesAReadTokenForTheCaller(t *testing.T) {
 func TestFetchURL_UnsignedWhenNoSignerConfigured(t *testing.T) {
 	ts, signed := newSignedTestServer(t, false)
 	fileHash, _ := uploadSignedFixture(t, ts)
-	readToken, _, _ := signed.MintToken(auth.ScopeRead, "carol", time.Minute)
+	readToken, _, _ := signed.MintToken(auth.ScopeRead, "carol", signedURLTestRepo, time.Minute)
 	resp := doAuthed(t, "GET", ts.URL+"/v2/reconstructions/"+fileHash.Hex(), readToken, nil)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()

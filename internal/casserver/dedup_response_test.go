@@ -99,8 +99,8 @@ func TestChunkDedup_ResponseIsACompleteShardFile(t *testing.T) {
 	if shard.Footer.ChunkLookupNumEntry != 2 || len(shard.Xorbs) != 1 || len(shard.Files) != 0 {
 		t.Fatalf("dedup response: chunkLookup=%d xorbs=%d files=%d, want 2/1/0", shard.Footer.ChunkLookupNumEntry, len(shard.Xorbs), len(shard.Files))
 	}
-	if !shard.Footer.ChunkHashHMACKey.IsZero() {
-		t.Fatalf("dedup response carries an HMAC key; the client would key its chunk hashes and never match")
+	if shard.Footer.ChunkHashHMACKey.IsZero() {
+		t.Fatalf("dedup response has a zero chunk-hash HMAC key: raw chunk hashes leak to every caller")
 	}
 
 	// The same holds for a server restored from a snapshot, including

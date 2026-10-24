@@ -33,6 +33,17 @@
 // always be for the whole thing, regardless of what the downstream
 // caller actually asked for - IngestFileRecon assumes a complete list.
 //
+// A file often cites only part of a shared xorb (Xet dedups across
+// files/repos). Those bytes cannot reproduce the original xorb's hash,
+// but they are still a complete chunk stream: ensureFileReconCached
+// repackages each contiguous fetch_info group as a new xorb under its
+// own content hash and rewrites the file's terms to point at it. No
+// partial slice is ever stored under the original hash, and the file
+// remains fully servable after the handoff to a plain xetd. Only when
+// fetch_info leaves a gap in a term's coverage does the request fall
+// back to a live relay (correctness is preserved, but that file is not
+// cached).
+//
 // -no-cache disables all of the above: every request is relayed live to
 // upstream via internal/hfclient directly, embedded is never touched.
 package proxycas
@@ -56,6 +67,7 @@ import (
 	"github.com/guilt/xet-server/internal/reconwire"
 	"github.com/guilt/xet-server/internal/shardformat"
 	"github.com/guilt/xet-server/internal/storage"
+	"github.com/guilt/xet-server/internal/xorbformat"
 )
 
 // xorbPrefix/chunkDedupPrefix match casserver's own (unexported)
@@ -588,19 +600,23 @@ func (s *Server) fetchAndIngestXorb(r *http.Request, cas *hfclient.CASClient, ha
 }
 
 // errPartialXorbCoverage reports that a reconstruction's fetch_info
-// covers only PART of the xorb it references, so the whole xorb can never
-// be assembled (let alone hash-verified) from it.
+// cannot be assembled into the original whole xorb under its own content
+// hash (either it starts mid-xorb, or it starts at chunk 0 but stops
+// short).
 //
 // This is a normal, expected condition, not a failure: a xorb packs chunks
 // from many files, and a given file's reconstruction only ever cites the
 // chunk ranges THAT file needs. A file using chunks 15-21 of a 1000-chunk
 // xorb gets exactly one fetch_info entry covering those bytes. The
 // presigned URL in that entry is scoped by signature to precisely that
-// byte range - requesting the full object returns 403 - so there is no way
-// to widen it into the complete xorb the content-addressed store requires.
-// Callers treat this as "this xorb isn't cacheable from this particular
-// reconstruction" and fall back to relaying upstream's response, letting
-// the client fetch those bytes straight from the CDN.
+// byte range - requesting the full object returns 403 - so the slice can
+// never be widened into the original xorb.
+//
+// The slice is still useful: ensureFileReconCached turns each contiguous
+// cited chunk group into a new xorb under its own content hash (see
+// cachePartialGroup), so the file remains offline-capable without storing
+// anything under a hash it does not match. If fetch_info leaves a gap in
+// a term's coverage, the whole file falls back to a live relay instead.
 var errPartialXorbCoverage = errors.New("proxycas: reconstruction fetch_info covers only part of the xorb")
 
 // cacheXorbFromFetchInfo ensures hash's bytes and footer are present in
@@ -613,14 +629,12 @@ var errPartialXorbCoverage = errors.New("proxycas: reconstruction fetch_info cov
 // without presigned URLs (this project's own casserver, or a test
 // stand-in) falls back to the direct xorb-fetch path via ensureXorbCached.
 //
-// Returns errPartialXorbCoverage when fetch_info doesn't span the xorb from
-// chunk 0 - see that error's doc comment for why that's expected rather
-// than exceptional. That case is detected BEFORE any network transfer,
-// so a partially-cited xorb costs no bandwidth here at all (the previous
-// version downloaded the cited ranges, concatenated them, then failed
-// IngestXorb's hash check with a misleading "xorb hash in URL does not
-// match hash computed from chunk contents", re-paying that transfer on
-// every subsequent request for the same file).
+// Returns errPartialXorbCoverage when fetch_info can't reproduce the
+// original xorb's hash - see that error's doc comment. A mid-xorb slice
+// is detected BEFORE any network transfer; a chunk-0 prefix is only
+// detectable after hashing the fetched bytes. Both cases are expected,
+// and ensureFileReconCached responds by caching the exact cited slice as
+// a synthetic xorb rather than by failing the file.
 func (s *Server) cacheXorbFromFetchInfo(r *http.Request, hash merklehash.Hash, infos []reconwire.FetchInfoEntry) error {
 	if s.Embedded.HasXorbFooter(hash) {
 		if has, err := s.Embedded.HasXorbBytes(r.Context(), hash); err == nil && has {
@@ -681,10 +695,213 @@ func (s *Server) cacheXorbFromFetchInfo(r *http.Request, hash merklehash.Hash, i
 	return nil
 }
 
+// cachePartialGroup caches one contiguous chunk group that a file's
+// fetch_info describes for a single xorb, and returns the synthetic hash
+// plus the chunk range that hash covers. The group may include chunks the
+// current term does not use: upstream V1 commonly returns one entry per
+// contiguous run of needed chunks, shared by several terms.
+//
+// Real CAS presigned URLs are scoped to exactly the bytes described by
+// one fetch_info entry, so the cited slice can never be widened into the
+// original xorb. It is still a complete, self-describing chunk stream,
+// though: scanning its chunk headers lets us repackage exactly the
+// chunks in the group as a new xorb under its own content hash. The file
+// terms then point at that synthetic xorb, so the handoff to a plain
+// xetd is complete and offline-capable without storing a partial slice
+// under the original xorb's hash.
+//
+// Returns errPartialXorbCoverage (caller relays live) if the entries do
+// not provide every chunk in the group or the repackaged stream is
+// malformed.
+func (s *Server) cachePartialGroup(r *http.Request, xorbHash merklehash.Hash, xorbHex string, group []reconwire.FetchInfoEntry) (merklehash.Hash, uint32, uint32, error) {
+	if len(group) == 0 {
+		return merklehash.Hash{}, 0, 0, errPartialXorbCoverage
+	}
+	if err := validateFetchGroup(group); err != nil {
+		return merklehash.Hash{}, 0, 0, err
+	}
+	groupStart, groupEnd := groupChunkRange(group)
+
+	cas, err := casClientFromContext(r)
+	if err != nil {
+		return merklehash.Hash{}, 0, 0, err
+	}
+
+	chunks := make(map[uint32][]byte, groupEnd-groupStart)
+	for _, info := range group {
+		rangeHeader := fmt.Sprintf("bytes=%d-%d", info.URLRange.Start, info.URLRange.End)
+		resp, err := cas.FetchPresigned(r.Context(), info.URL, rangeHeader)
+		if err != nil {
+			return merklehash.Hash{}, 0, 0, fmt.Errorf("fetch partial xorb %s range %s: %w", xorbHex, rangeHeader, err)
+		}
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			return merklehash.Hash{}, 0, 0, &upstreamStatusError{Status: resp.StatusCode, Body: string(body)}
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return merklehash.Hash{}, 0, 0, fmt.Errorf("read partial xorb %s range %s: %w", xorbHex, rangeHeader, readErr)
+		}
+		if info.URLRange.End < info.URLRange.Start || int64(len(body)) != info.URLRange.End-info.URLRange.Start+1 {
+			slog.Debug("proxycas: presigned slice length does not match url_range",
+				"xorb", xorbHex, "range", rangeHeader, "got", len(body))
+			return merklehash.Hash{}, 0, 0, errPartialXorbCoverage
+		}
+		entries, err := xorbformat.ScanChunks(bytes.NewReader(body))
+		if err != nil {
+			return merklehash.Hash{}, 0, 0, fmt.Errorf("scan partial xorb %s range %s: %w", xorbHex, rangeHeader, err)
+		}
+		for i, ce := range entries {
+			idx := info.Range.Start + uint32(i)
+			if idx >= groupEnd {
+				break
+			}
+			if idx < groupStart {
+				continue
+			}
+			end := ce.DataOffset + int64(ce.Header.CompressedLength)
+			if end > int64(len(body)) {
+				return merklehash.Hash{}, 0, 0, errPartialXorbCoverage
+			}
+			if _, ok := chunks[idx]; !ok {
+				chunks[idx] = body[ce.HeaderOffset:end]
+			}
+		}
+	}
+	for idx := groupStart; idx < groupEnd; idx++ {
+		if len(chunks[idx]) == 0 {
+			return merklehash.Hash{}, 0, 0, errPartialXorbCoverage
+		}
+	}
+
+	var buf bytes.Buffer
+	for idx := groupStart; idx < groupEnd; idx++ {
+		buf.Write(chunks[idx])
+	}
+	data := buf.Bytes()
+	footer, syntheticHash, err := xorbformat.DeriveFooter(bytes.NewReader(data))
+	if err != nil {
+		return merklehash.Hash{}, 0, 0, fmt.Errorf("derive partial xorb %s footer: %w", xorbHex, err)
+	}
+	if footer.NumChunks != groupEnd-groupStart {
+		return merklehash.Hash{}, 0, 0, errPartialXorbCoverage
+	}
+	if _, err := s.Embedded.IngestXorb(r.Context(), syntheticHash, bytes.NewReader(data)); err != nil {
+		return merklehash.Hash{}, 0, 0, fmt.Errorf("ingest partial xorb %s as %s: %w", xorbHex, syntheticHash.Hex(), err)
+	}
+	if syntheticHash == xorbHash {
+		// The group turned out to be the whole xorb (the file cited it
+		// across several adjacent fetch_info entries). The original hash
+		// is correct, so terms keep their original chunk indexes.
+		groupStart = 0
+	}
+	slog.Debug("proxycas: cached partial xorb group as synthetic xorb",
+		"original_xorb", xorbHex, "synthetic_xorb", syntheticHash.Hex(),
+		"chunks", footer.NumChunks)
+	return syntheticHash, groupStart, groupEnd, nil
+}
+
+// validateFetchGroup rejects entries with an empty chunk range.
+func validateFetchGroup(group []reconwire.FetchInfoEntry) error {
+	for _, info := range group {
+		if info.Range.End <= info.Range.Start {
+			return errPartialXorbCoverage
+		}
+	}
+	return nil
+}
+
+func groupChunkRange(group []reconwire.FetchInfoEntry) (start, end uint32) {
+	start, end = group[0].Range.Start, group[0].Range.End
+	for _, info := range group[1:] {
+		if info.Range.Start < start {
+			start = info.Range.Start
+		}
+		if info.Range.End > end {
+			end = info.Range.End
+		}
+	}
+	return start, end
+}
+
+// fillPartialGroups caches every contiguous fetch_info group for one
+// xorb and rewrites the file terms that fall inside each group. Terms
+// that cannot be placed in a complete group leave the file uncacheable,
+// in which case the caller relays live.
+func (s *Server) fillPartialGroups(r *http.Request, xorbHash merklehash.Hash, xorbHex string, slots []termSlot, infos []reconwire.FetchInfoEntry, entries []shardformat.FileDataSequenceEntry) error {
+	groups := contiguousFetchGroups(infos)
+	if len(groups) == 0 {
+		return errPartialXorbCoverage
+	}
+	assigned := make([]bool, len(entries))
+	for _, group := range groups {
+		hash, groupStart, groupEnd, err := s.cachePartialGroup(r, xorbHash, xorbHex, group)
+		if err != nil {
+			if errors.Is(err, errPartialXorbCoverage) {
+				continue
+			}
+			return err
+		}
+		for _, slot := range slots {
+			term := slot.term
+			if term.Range.Start < groupStart || term.Range.End > groupEnd {
+				continue
+			}
+			entries[slot.idx] = shardformat.FileDataSequenceEntry{
+				XorbHash:             hash,
+				UnpackedSegmentBytes: term.UnpackedLength,
+				ChunkIndexStart:      term.Range.Start - groupStart,
+				ChunkIndexEnd:        term.Range.End - groupStart,
+			}
+			assigned[slot.idx] = true
+		}
+	}
+	for _, slot := range slots {
+		if !assigned[slot.idx] {
+			return errPartialXorbCoverage
+		}
+	}
+	return nil
+}
+
+// contiguousFetchGroups merges fetch_info entries whose chunk ranges
+// touch or overlap. Each returned group is a complete chunk run that can
+// be repackaged as one synthetic xorb.
+func contiguousFetchGroups(infos []reconwire.FetchInfoEntry) [][]reconwire.FetchInfoEntry {
+	ordered := append([]reconwire.FetchInfoEntry(nil), infos...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Range.Start != ordered[j].Range.Start {
+			return ordered[i].Range.Start < ordered[j].Range.Start
+		}
+		return ordered[i].Range.End < ordered[j].Range.End
+	})
+	var groups [][]reconwire.FetchInfoEntry
+	for _, info := range ordered {
+		if info.Range.End <= info.Range.Start {
+			continue
+		}
+		if len(groups) == 0 {
+			groups = append(groups, []reconwire.FetchInfoEntry{info})
+			continue
+		}
+		last := &groups[len(groups)-1]
+		_, end := groupChunkRange(*last)
+		if info.Range.Start <= end {
+			*last = append(*last, info)
+			continue
+		}
+		groups = append(groups, []reconwire.FetchInfoEntry{info})
+	}
+	return groups
+}
+
 // citesXorbFromStart reports whether infos covers the xorb beginning at
 // its first chunk (index 0). A xorb is content-addressed over ALL its
-// chunks, so a citation that starts anywhere else can never be assembled
-// into the verifiable whole - see errPartialXorbCoverage.
+// chunks, so a citation that starts anywhere else can never reproduce the
+// original hash - see errPartialXorbCoverage. Such a citation is still
+// cacheable as a synthetic xorb by cachePartialGroup.
 func citesXorbFromStart(infos []reconwire.FetchInfoEntry) bool {
 	for _, info := range infos {
 		if info.Range.Start == 0 {
@@ -784,11 +1001,11 @@ func (s *Server) handleReconstructionCommon(w http.ResponseWriter, r *http.Reque
 		// never fail the download. Relay live and let the client proceed;
 		// the local cache simply doesn't advance for this file.
 		if errors.Is(err, errPartialXorbCoverage) {
-			// Expected and unavoidable: this file uses only part of a
-			// shared xorb, whose presigned URL is signature-scoped to
-			// that slice. Debug, not Warn - it would otherwise fire for
-			// a large fraction of files in any densely-packed repo.
-			slog.Debug("proxycas: file not cacheable (partial xorb citation), relaying live",
+			// A term's fetch_info did not exactly cover the chunk range
+			// it cites, so no synthetic xorb could be built from the
+			// presigned slice. This is now the exception, not the rule:
+			// ordinary shared-xorb slices are cached by fillPartialGroups.
+			slog.Debug("proxycas: file not cacheable (term/slice coverage mismatch), relaying live",
 				"file_id", fileIDHex)
 		} else {
 			slog.Warn("proxycas: reconstruction cache-ingest failed, falling back to live relay (client still downloads via presigned URLs)",
@@ -841,6 +1058,11 @@ func (s *Server) relayReconstructionLive(w http.ResponseWriter, r *http.Request,
 // than one request strictly needs; the benefit is that any file ever
 // requested - at any range - becomes wholly and safely offline-capable
 // after that first request.
+type termSlot struct {
+	idx  int
+	term reconwire.Term
+}
+
 func (s *Server) ensureFileReconCached(r *http.Request, fileID merklehash.Hash) (found bool, err error) {
 	if s.Embedded.HasFileRecon(fileID) {
 		return true, nil
@@ -877,34 +1099,49 @@ func (s *Server) ensureFileReconCached(r *http.Request, fileID merklehash.Hash) 
 		return false, fmt.Errorf("decode reconstruction for %s: %w", fileIDHex, err)
 	}
 
-	entries := make([]shardformat.FileDataSequenceEntry, 0, len(wire.Terms))
-	for _, term := range wire.Terms {
-		xorbHash, err := merklehash.FromHex(term.Hash)
+	entries := make([]shardformat.FileDataSequenceEntry, len(wire.Terms))
+	byHash := make(map[string][]termSlot)
+	var order []string
+	for i, term := range wire.Terms {
+		if _, ok := byHash[term.Hash]; !ok {
+			order = append(order, term.Hash)
+		}
+		byHash[term.Hash] = append(byHash[term.Hash], termSlot{idx: i, term: term})
+	}
+	for _, hashHex := range order {
+		slots := byHash[hashHex]
+		xorbHash, err := merklehash.FromHex(hashHex)
 		if err != nil {
-			return false, fmt.Errorf("reconstruction for %s: invalid xorb hash %q: %w", fileIDHex, term.Hash, err)
+			return false, fmt.Errorf("reconstruction for %s: invalid xorb hash %q: %w", fileIDHex, hashHex, err)
 		}
-		if err := s.cacheXorbFromFetchInfo(r, xorbHash, wire.FetchInfo[term.Hash]); err != nil {
-			if errors.Is(err, errPartialXorbCoverage) {
-				// Expected for any file that uses only part of a shared
-				// xorb (see errPartialXorbCoverage). This file can't be
-				// served from cache, so don't record a file_recon that
-				// would later point at xorb bytes we don't have -
-				// casserver's reconstruction handler has no fallback for
-				// a term whose xorb is missing and would hard-error.
-				// Reporting notFound=false with no error makes the
-				// caller relay upstream live instead.
-				slog.Debug("proxycas: file not cacheable, some xorbs only partially cited by its reconstruction",
-					"file_id", fileIDHex, "xorb", term.Hash)
-				return false, errPartialXorbCoverage
+		infos := wire.FetchInfo[hashHex]
+		if err := s.cacheXorbFromFetchInfo(r, xorbHash, infos); err != nil {
+			if !errors.Is(err, errPartialXorbCoverage) {
+				return false, fmt.Errorf("cache xorb %s referenced by %s: %w", hashHex, fileIDHex, err)
 			}
-			return false, fmt.Errorf("cache xorb %s referenced by %s: %w", term.Hash, fileIDHex, err)
+			// The file cites only part of a shared xorb, so the original
+			// xorb can't be reconstructed. Repackage each contiguous
+			// fetch_info group as a synthetic xorb under its own hash
+			// and rewrite the terms that fall inside it. This is what
+			// makes dataset/dense-repo handoffs complete offline.
+			if perr := s.fillPartialGroups(r, xorbHash, hashHex, slots, infos, entries); perr != nil {
+				if errors.Is(perr, errPartialXorbCoverage) {
+					slog.Debug("proxycas: file not cacheable, fetch_info does not cover every term",
+						"file_id", fileIDHex, "xorb", hashHex)
+					return false, errPartialXorbCoverage
+				}
+				return false, fmt.Errorf("cache partial xorb %s referenced by %s: %w", hashHex, fileIDHex, perr)
+			}
+			continue
 		}
-		entries = append(entries, shardformat.FileDataSequenceEntry{
-			XorbHash:             xorbHash,
-			UnpackedSegmentBytes: term.UnpackedLength,
-			ChunkIndexStart:      term.Range.Start,
-			ChunkIndexEnd:        term.Range.End,
-		})
+		for _, slot := range slots {
+			entries[slot.idx] = shardformat.FileDataSequenceEntry{
+				XorbHash:             xorbHash,
+				UnpackedSegmentBytes: slot.term.UnpackedLength,
+				ChunkIndexStart:      slot.term.Range.Start,
+				ChunkIndexEnd:        slot.term.Range.End,
+			}
+		}
 	}
 
 	s.Embedded.IngestFileRecon(fileID, entries)

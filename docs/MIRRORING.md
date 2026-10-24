@@ -203,8 +203,8 @@ Point `HF_ENDPOINT` at `:8421` exactly like you would for `xetd` - every
 `hf download` (and `hf upload`, relayed straight through to the real Hub)
 just works, with no repo-by-repo setup. The first time any model is
 requested it's fetched from the real huggingface.co; every request after
-that is served locally **to the extent it was cacheable** (see the
-important caveat below). See the main README's
+that is served locally from that cache, including shared-xorb slices
+packaged as synthetic xorbs (see 9.1 below). See the main README's
 [Caching pull-through proxy](../README.md#caching-pull-through-proxy-xet-proxyd)
 section for the full flag reference (rate limiting, cache TTL, the
 `-no-cache` pure-relay escape hatch), and its
@@ -214,14 +214,10 @@ proxy, point a plain `xetd` at the exact same `-data` directory, and
 what the proxy did cache keeps working, byte-identical, with no proxy
 process required.
 
-### 9.1 Important: what the proxy can and cannot cache
+### 9.1 Partial xorb slices are cached as synthetic xorbs
 
-**Downloading through `xet-proxyd` does not guarantee the content is
-cached.** The proxy caches a xorb only when it can verify the bytes it
-fetched against that xorb's content hash, and it frequently cannot:
-
-A file's reconstruction response includes `fetch_info` entries giving the
-byte ranges **that file needs** from each xorb - not necessarily the whole
+A file's reconstruction includes `fetch_info` entries giving the byte
+ranges **that file needs** from each xorb - not necessarily the whole
 xorb. When a file uses only part of one, e.g.
 
 ```
@@ -229,33 +225,33 @@ url_range = 1108398-1679278  (570,881 bytes)   chunk range = 15-21
 ```
 
 the proxy has chunks 15-21 of a 1042-chunk xorb. Hashing those cannot
-reproduce the whole xorb's hash, so the xorb is rejected rather than
-stored under a hash it doesn't match (storing it anyway would corrupt the
-cache). Partial ranges are common in practice, because Xet deduplicates
-across repos: a file often references xorbs that were originally written
-for *other* files, and uses only the chunks it shares with them.
+reproduce the whole xorb's hash, so it does not store them under that
+hash. It instead repackages the cited chunks as a **new xorb under their
+own content hash** and rewrites the file's terms to reference it. That
+synthetic xorb is complete and verifiable, so the file keeps working
+after the offline handoff - even when the original xorb is shared with
+thousands of other files.
 
-When this happens the download still succeeds - the proxy falls back to
-relaying upstream's reconstruction, and the client fetches those xorbs
-straight from the CDN via the presigned URLs - but nothing is added to
-the local cache for that file. Watch for this in the proxy's log:
+A file still falls back to a live relay when `fetch_info` does not cover
+every chunk a term cites (an incomplete upstream response). The download
+succeeds from the CDN, but that file is not cached; the proxy logs it at
+`DEBUG`:
 
 ```
-WARN proxycas: reconstruction cache-ingest failed, falling back to live relay
+DEBUG proxycas: file not cacheable, fetch_info does not cover every term
 ```
 
-So `xet-proxyd` is dependable as a **transparent accelerator and partial
-offline buffer**, but it is *not* a dependable way to construct a complete
-offline library. For that, use the two-phase approach in section 10, which
-has no such limitation.
-
+Non-Xet blobs (a repo's `README.md`, `.gitattributes`, small CSVs) are
+relayed live and are not part of the CAS cache at all. Section 10 is the
+way to guarantee those too.
 ## 10. Building a guaranteed-complete offline library (two-phase)
 
 If your goal is "I want to unplug the network, run a plain `xetd`, and
-have all of these models work", do this instead. It sidesteps section
-9.1's limitation entirely, because the **upload** path has no partial-xorb
-problem: `hf_xet` chunks the local file itself and uploads whole xorbs,
-which `xetd` stores and indexes completely.
+have all of these files work", this is the guaranteed way. It also covers
+non-Xet blobs that section 9.1 says are relayed live, because the
+**upload** path has no partial-xorb problem: `hf_xet` chunks the local
+file itself and uploads whole xorbs, which `xetd` stores and indexes
+completely.
 
 **Phase 1 - download** the repos you want, from the real Hub, to plain
 files on disk (no proxy needed):

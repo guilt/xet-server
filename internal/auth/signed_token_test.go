@@ -2,14 +2,19 @@ package auth
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
 
 // Every secret below is a hardcoded test fixture, not a real credential.
 const signedFixtureSecret = "signed-fixture-secret-not-real"
+
+var signedFixtureRepo = Repo{Type: "model", ID: "alice/sec"}
 
 func reqWithHeader(value string) *http.Request {
 	r, _ := http.NewRequest(http.MethodGet, "http://example/", nil)
@@ -61,7 +66,7 @@ func TestSignedTokenAuth_BasicWithSecretPasswordNamesTheUser(t *testing.T) {
 
 func TestSignedTokenAuth_MintedTokenRoundTrip(t *testing.T) {
 	a := NewSignedTokenAuth(signedFixtureSecret)
-	token, exp, err := a.MintToken(ScopeRead, "bob", time.Hour)
+	token, exp, err := a.MintToken(ScopeRead, "bob", signedFixtureRepo, time.Hour)
 	if err != nil {
 		t.Fatalf("MintToken() error = %v", err)
 	}
@@ -75,6 +80,12 @@ func TestSignedTokenAuth_MintedTokenRoundTrip(t *testing.T) {
 	if p.Subject() != "bob" {
 		t.Errorf("Subject() = %q, want bob", p.Subject())
 	}
+	if got := RepoOf(p); got != signedFixtureRepo {
+		t.Errorf("RepoOf() = %v, want %v", got, signedFixtureRepo)
+	}
+	if !AllowsRepo(p, signedFixtureRepo) || AllowsRepo(p, Repo{Type: "model", ID: "bob/private"}) {
+		t.Error("token must allow its own repo and no other")
+	}
 	if !p.HasScope(ScopeRead) || p.HasScope(ScopeWrite) {
 		t.Error("read token must grant read only")
 	}
@@ -87,7 +98,7 @@ func TestSignedTokenAuth_MintedTokenRoundTrip(t *testing.T) {
 	}
 
 	// A write token grants both.
-	wtoken, _, _ := a.MintToken(ScopeWrite, "carol", time.Hour)
+	wtoken, _, _ := a.MintToken(ScopeWrite, "carol", signedFixtureRepo, time.Hour)
 	wp, err := a.Authenticate(reqWithHeader("Bearer " + wtoken))
 	if err != nil {
 		t.Fatalf("Authenticate(write token) error = %v", err)
@@ -99,24 +110,33 @@ func TestSignedTokenAuth_MintedTokenRoundTrip(t *testing.T) {
 
 func TestSignedTokenAuth_RejectsTamperedExpiredAndForeignTokens(t *testing.T) {
 	a := NewSignedTokenAuth(signedFixtureSecret)
-	token, _, _ := a.MintToken(ScopeRead, "bob", time.Hour)
+	token, _, _ := a.MintToken(ScopeRead, "bob", signedFixtureRepo, time.Hour)
 
 	// Flip the scope in the payload: MAC no longer matches.
-	tampered := []byte(token)
-	copy(tampered[len(mintedTokenPrefix)+1+10+1:], "writ")
-	if _, err := a.Authenticate(reqWithHeader("Bearer " + string(tampered))); !errors.Is(err, ErrUnauthenticated) {
-		t.Errorf("tampered token: err = %v, want ErrUnauthenticated", err)
+	parts := strings.Split(token, ".")
+	parts[2] = string(ScopeWrite)
+	tampered := strings.Join(parts, ".")
+	if _, err := a.Authenticate(reqWithHeader("Bearer " + tampered)); !errors.Is(err, ErrUnauthenticated) {
+		t.Errorf("tampered scope: err = %v, want ErrUnauthenticated", err)
+	}
+
+	// Swap in a different repo: MAC no longer matches, which is what
+	// stops a token for one repo from being rewritten for another.
+	parts = strings.Split(token, ".")
+	parts[5] = hex.EncodeToString([]byte("bob/private"))
+	if _, err := a.Authenticate(reqWithHeader("Bearer " + strings.Join(parts, "."))); !errors.Is(err, ErrUnauthenticated) {
+		t.Errorf("tampered repo: err = %v, want ErrUnauthenticated", err)
 	}
 
 	// Minted under a different secret.
 	other := NewSignedTokenAuth("a-different-fixture-secret")
-	foreign, _, _ := other.MintToken(ScopeWrite, "bob", time.Hour)
+	foreign, _, _ := other.MintToken(ScopeWrite, "bob", signedFixtureRepo, time.Hour)
 	if _, err := a.Authenticate(reqWithHeader("Bearer " + foreign)); !errors.Is(err, ErrUnauthenticated) {
 		t.Errorf("foreign token: err = %v, want ErrUnauthenticated", err)
 	}
 
 	// Expired: mint with a 1s ttl and back-date by rebuilding the MAC.
-	expired := mintedPayload(time.Now().Add(-time.Minute).Unix(), ScopeRead, "bob")
+	expired := mintedPayload(time.Now().Add(-time.Minute).Unix(), ScopeRead, "bob", signedFixtureRepo)
 	expired += "." + hexMAC(a, expired)
 	if _, err := a.Authenticate(reqWithHeader("Bearer " + expired)); !errors.Is(err, ErrUnauthenticated) {
 		t.Errorf("expired token: err = %v, want ErrUnauthenticated", err)
@@ -146,7 +166,7 @@ func TestSignedTokenAuth_AdminScopeIsTheSecretOnly(t *testing.T) {
 			}
 		}
 	}
-	minted, _, err := a.MintToken(ScopeWrite, "alice", time.Hour)
+	minted, _, err := a.MintToken(ScopeWrite, "alice", signedFixtureRepo, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +177,7 @@ func TestSignedTokenAuth_AdminScopeIsTheSecretOnly(t *testing.T) {
 	if p.HasScope(ScopeAdmin) || !p.HasScope(ScopeWrite) {
 		t.Errorf("minted write token: admin = %v, write = %v", p.HasScope(ScopeAdmin), p.HasScope(ScopeWrite))
 	}
-	forged := mintedPayload(time.Now().Add(time.Hour).Unix(), ScopeAdmin, "alice")
+	forged := mintedPayload(time.Now().Add(time.Hour).Unix(), ScopeAdmin, "alice", signedFixtureRepo)
 	forged += "." + hexMAC(a, forged)
 	if _, err := a.Authenticate(reqWithHeader("Bearer " + forged)); !errors.Is(err, ErrUnauthenticated) {
 		t.Errorf("token claiming admin scope: err = %v, want ErrUnauthenticated", err)
@@ -166,14 +186,63 @@ func TestSignedTokenAuth_AdminScopeIsTheSecretOnly(t *testing.T) {
 
 func TestSignedTokenAuth_MintRefusesBadInputs(t *testing.T) {
 	a := NewSignedTokenAuth(signedFixtureSecret)
-	if _, _, err := a.MintToken(Scope("admin"), "x", time.Hour); err == nil {
+	if _, _, err := a.MintToken(Scope("admin"), "x", signedFixtureRepo, time.Hour); err == nil {
 		t.Error("minting an unknown scope should fail")
 	}
-	if _, _, err := a.MintToken(ScopeRead, "x", 0); err == nil {
+	if _, _, err := a.MintToken(ScopeRead, "x", signedFixtureRepo, 0); err == nil {
 		t.Error("minting with a zero ttl should fail")
 	}
-	if _, _, err := NewSignedTokenAuth("").MintToken(ScopeRead, "x", time.Hour); err == nil {
+	if _, _, err := NewSignedTokenAuth("").MintToken(ScopeRead, "x", signedFixtureRepo, time.Hour); err == nil {
 		t.Error("minting with an empty secret should fail")
+	}
+}
+
+// TestSignedTokenAuth_RepoScopedCreateOnlyInsideNamespace pins the repo
+// creation rule: a write token minted for alice/sec may add another repo
+// under alice, but not one under bob; only the shared secret's admin scope
+// crosses namespaces.
+func TestSignedTokenAuth_RepoScopedCreateOnlyInsideNamespace(t *testing.T) {
+	a := NewSignedTokenAuth(signedFixtureSecret)
+	token, _, err := a.MintToken(ScopeWrite, "alice", signedFixtureRepo, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := a.Authenticate(reqWithHeader("Bearer " + token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		repo Repo
+		want bool
+	}{
+		{Repo{Type: "model", ID: "alice/new"}, true},
+		{Repo{Type: "dataset", ID: "alice/data"}, true},
+		{Repo{Type: "model", ID: "bob/x"}, false},
+		{Repo{Type: "model", ID: "carol/x"}, false},
+	} {
+		if got := AllowsRepoCreate(p, tc.repo); got != tc.want {
+			t.Errorf("AllowsRepoCreate(%v) = %v, want %v", tc.repo, got, tc.want)
+		}
+	}
+
+	admin, err := a.Authenticate(reqWithHeader("Bearer " + signedFixtureSecret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !AllowsRepoCreate(admin, Repo{Type: "model", ID: "bob/private"}) {
+		t.Error("shared secret must be able to create repositories in any namespace")
+	}
+}
+
+// TestSignedTokenAuth_OldUnscopedTokenFormatRejected: tokens from the
+// previous format carried no repo, so accepting them would reopen the
+// cross-repo hole. They are refused rather than downgraded.
+func TestSignedTokenAuth_OldUnscopedTokenFormatRejected(t *testing.T) {
+	a := NewSignedTokenAuth(signedFixtureSecret)
+	old := "xst1." + strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) + ".read." + hex.EncodeToString([]byte("bob"))
+	old += "." + hexMAC(a, old)
+	if _, err := a.Authenticate(reqWithHeader("Bearer " + old)); !errors.Is(err, ErrUnauthenticated) {
+		t.Errorf("xst1 token: err = %v, want ErrUnauthenticated", err)
 	}
 }
 

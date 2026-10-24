@@ -22,6 +22,11 @@ func (s *Store) Delete(_ context.Context, key string) error
     a partial failure, shouldn't need to distinguish "already gone" from "just
     removed").
 
+func (s *Store) Enumerate(ctx context.Context, fn func(key string, size int64, modTime time.Time) error) error
+    Enumerate implements storage.Enumerator: every completed blob under Root,
+    by key, size and modification time. Staging files are skipped (and reaped
+    once older than staleTempFileAge - see TotalBytes, whose walk this is).
+
 func (s *Store) Get(_ context.Context, key string) (io.ReadCloser, error)
 
 func (s *Store) GetRange(_ context.Context, key string, offset, length int64) (io.ReadCloser, error)
@@ -41,7 +46,7 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader, size int64) (w
     see TestAdversarial_ConcurrentUploadsOfSameXorb), and each needs its own
     independent staging file rather than colliding on one shared path.
 
-func (s *Store) TotalBytes(_ context.Context) (int64, error)
+func (s *Store) TotalBytes(ctx context.Context) (int64, error)
     TotalBytes walks the store's root and sums the size of every *completed*
     stored blob. This is an O(number of blobs) directory walk, not a cached
     counter - fine for a slow poll (an eviction sweep runs every few minutes at

@@ -1,6 +1,7 @@
 package shardformat
 
 import (
+	"errors"
 	"io"
 
 	"github.com/guilt/xet-server/internal/merklehash"
@@ -57,6 +58,25 @@ const NoExpiry = ^uint64(0)
 // a client may keep deduplicating against them without asking again -
 // the horizon a garbage collector on that server has to respect.
 func WriteShardExpiring(w io.Writer, files []FileEntry, xorbs []XorbEntry, expiry uint64) (Footer, error) {
+	return writeShard(w, files, xorbs, nil, expiry)
+}
+
+// WriteKeyedShardExpiring serializes an xorb-only shard whose chunk hashes
+// are keyed with key, matching xet-core's MDBShardInfo::export_as_keyed_shard
+// (DataHash::hmac, the same BLAKE3 keyed hash this package's merklehash
+// exposes as Hash.HMAC). The client computes the same keyed hash for each
+// chunk it already holds, so it can only match chunks in a response if it
+// has the shard's random key. key must be non-zero: a zero key would
+// advertise raw chunk hashes to every caller, which is the exact leak this
+// function exists to avoid.
+func WriteKeyedShardExpiring(w io.Writer, xorbs []XorbEntry, key merklehash.Hash, expiry uint64) (Footer, error) {
+	if key.IsZero() {
+		return Footer{}, errors.New("shardformat: refusing to write a shard with a zero chunk-hash key")
+	}
+	return writeShard(w, nil, xorbs, &key, expiry)
+}
+
+func writeShard(w io.Writer, files []FileEntry, xorbs []XorbEntry, chunkKey *merklehash.Hash, expiry uint64) (Footer, error) {
 	var buf countingWriter
 	cw := io.MultiWriter(w, &buf)
 
@@ -65,6 +85,9 @@ func WriteShardExpiring(w io.Writer, files []FileEntry, xorbs []XorbEntry, expir
 	}
 
 	footer := Footer{}
+	if chunkKey != nil {
+		footer.ChunkHashHMACKey = *chunkKey
+	}
 	footer.FileInfoOffset = buf.n
 
 	var fileLookup []FileLookupEntry
@@ -119,11 +142,17 @@ func WriteShardExpiring(w io.Writer, files []FileEntry, xorbs []XorbEntry, expir
 			return Footer{}, err
 		}
 		for i, c := range x.Chunks {
-			if err := WriteXorbChunkSequenceEntry(cw, c); err != nil {
+			chunkHash := c.ChunkHash
+			if chunkKey != nil {
+				chunkHash = chunkHash.HMAC(*chunkKey)
+			}
+			entry := c
+			entry.ChunkHash = chunkHash
+			if err := WriteXorbChunkSequenceEntry(cw, entry); err != nil {
 				return Footer{}, err
 			}
 			chunkLookup = append(chunkLookup, ChunkLookupEntry{
-				Key: c.ChunkHash.TruncateHash(), XorbIndex: xorbIndex, ChunkIndex: uint32(i),
+				Key: chunkHash.TruncateHash(), XorbIndex: xorbIndex, ChunkIndex: uint32(i),
 			})
 		}
 		xorbIndex += 1 + uint32(len(x.Chunks))

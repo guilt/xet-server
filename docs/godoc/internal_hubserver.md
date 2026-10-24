@@ -66,6 +66,15 @@ type Server struct {
 
 func New(casBaseURL string, cas casInfo) *Server
 
+func (s *Server) FileSHA256s() []string
+    FileSHA256s returns the plain SHA-256 of every file any revision of any
+    repo lists - the files `hf upload` committed through this shim. The CAS's
+    garbage collector keeps these regardless of the keep list a request carries:
+    they have no git repo an operator could list them from, and this registry
+    is the only record that they are still wanted. Files pushed through the
+    git-lfs bridge are not registered here (docs/GIT_LFS.md, known limits),
+    which is why that keep list exists.
+
 func (s *Server) HasFile(repoType, repoID, revision, path string) bool
     HasFile reports whether path has been recorded (via a real commit or
     IngestFile) under repoType/repoID/revision.
@@ -129,6 +138,20 @@ func (s *Server) SetAuthenticator(a auth.Authenticator)
     routes dispatch by parsing the path inside each handler rather than
     registering one mux pattern per logical endpoint, so there's no route table
     to rebuild.
+
+func (s *Server) SetLockDir(dir string) error
+    SetLockDir stores git-lfs locks as write-once files under dir instead of in
+    memory, so several replicas sharing a synced folder agree on who holds what
+    (see lockstore.go). Call before serving.
+
+func (s *Server) SetTokenMinter(m auth.TokenMinter)
+    SetTokenMinter replaces the minter behind the xet-{read,write}-token routes
+    and the git-lfs batch actions. Pass the same auth.SignedTokenAuth the paired
+    CAS authenticates with, so tokens this server issues are accepted there.
+
+func (s *Server) SetTokenTTL(ttl time.Duration)
+    SetTokenTTL sets the lifetime of minted tokens (default one hour).
+    Non-positive values are ignored.
 
 func (s *Server) Snapshot(path string) error
     Snapshot serializes s's repos/revisions/files to path via the same

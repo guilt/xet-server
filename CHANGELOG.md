@@ -1,7 +1,32 @@
 # Changelog
 
-## Unreleased - Git LFS bridge
+All notable changes to Xet Server will be documented in this file.
 
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.2.0] - 2026-10-24
+
+Full dataset handoff release. The pull-through proxy now caches shared-xorb
+slices as synthetic xorbs, so a plain `xetd` can serve deduplicated dataset
+files offline after the handoff. This release also brings the Git LFS
+bridge, garbage collection, synced-folder mode, and the repo-scoped/keyed
+dedup hardening below.
+
+### Added
+
+- **Partial-xorb download slices are cached for offline handoff.** When a
+  file's reconstruction cites only some chunks of a xorb shared with other
+  files (normal for datasets and deduplicated repos), the proxy now
+  repackages each contiguous cited chunk group as a new xorb under its own
+  content hash and rewrites the file's terms to reference it. Previously
+  such files were relayed live and cached nothing, so a plain `xetd`
+  handed the proxy's `-data` directory returned 404 for them. Files whose
+  `fetch_info` has a coverage gap still relay live (and download fine);
+  they are simply not cached. Verified against the real Hub with a
+  `bigcode/the-stack-v2` file whose reconstruction cites a 222-chunk slice
+  of a shared xorb: online through the proxy, then offline via `xetd` on
+  the same data directory with an identical SHA-256.
 - **Synced-folder mode (`-sync-folder`)**: the data directory can be a
   folder shared through Dropbox, Syncthing or a mount, with one xetd per
   machine. Shard bodies are persisted as content-named files, the index
@@ -58,17 +83,6 @@
   0.2.1 and recent hf_xet actually call) is served alongside
   `/v1/shards`. (The global-dedup prefix those clients send is covered
   under Fixed below.)
-
-
-All notable changes to Xet Server will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
-
-### Added
-
 - **Multi-client integration tests.** `integration-tests/multi_client_*.sh`
   run the real `hf` CLI as several machines (each with its own `HF_HOME`,
   `HF_XET_CACHE` and token) against one `xetd`, and assert from the
@@ -107,6 +121,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   xorb of every file referencing it (xorb-info only, like xet-core's
   reference client; capped at 65536 chunk entries).
 
+### Security
+
+- **Minted tokens are repo-scoped.** The Hub shim's HMAC-signed
+  tokens now carry the repo type and ID inside the signed payload (format
+  `xst2`), and every repo-addressed Hub route - token minting, repo info,
+  tree, resolve, preupload, commit, branch, and all git-lfs batch/object/
+  lock routes - rejects a token for a different repo with 403. A
+  repo-scoped write token may create a new repo only inside its own
+  namespace; creating elsewhere requires the shared secret. Tokens from
+  the previous unscoped `xst1` format are refused.
+  `integration-tests/repo_scope.sh`.
+- **Global-dedup answers are keyed.** `GET /v1/chunks/...` now
+  returns an xorb-only shard whose chunk hashes are BLAKE3-keyed with a
+  fresh random 32-byte key per response (footer `chunk_hash_hmac_key`),
+  matching xet-core's `export_as_keyed_shard`, and carries no
+  file-reconstruction entries. Previously the key was zero, so a caller
+  holding one chunk could learn the raw hashes of every other chunk (and
+  file hashes) in the matching xorbs.
 ## [1.1.0] - 2026-09-15
 
 ### Fixed

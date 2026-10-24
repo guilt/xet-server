@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/guilt/xet-server/internal/auth"
 	"github.com/guilt/xet-server/internal/merklehash"
@@ -381,5 +382,114 @@ func TestAuth_AdversarialAuthorizationHeaders(t *testing.T) {
 	healthResp.Body.Close()
 	if healthResp.StatusCode != http.StatusOK {
 		t.Errorf("server unhealthy after adversarial auth headers: repo-create status = %d", healthResp.StatusCode)
+	}
+}
+
+// newRepoScopedTestServer is a Hub shim authenticating with
+// SignedTokenAuth, the configuration cmd/xetd installs when -auth-token is
+// set. Tokens are minted directly in these tests so each case can name the
+// repo the credential is (and is not) allowed to touch.
+func newRepoScopedTestServer(t *testing.T) (*httptest.Server, *auth.SignedTokenAuth) {
+	t.Helper()
+	cas := newFakeCAS()
+	signed := auth.NewSignedTokenAuth(testFixtureToken)
+	hubSrv := New("http://localhost:9999", cas)
+	hubSrv.SetAuthenticator(signed)
+	hubSrv.SetTokenMinter(signed)
+	ts := httptest.NewServer(hubSrv)
+	t.Cleanup(ts.Close)
+	return ts, signed
+}
+
+// TestAuth_MintedTokenIsScopedToItsRepo is the regression test for the
+// cross-repo hole reported by openxet: a read token minted for alice/sec
+// read bob/private, and a write token minted for alice/sec created
+// carol/x. Every repo-addressed route must reject the mismatch with 403,
+// while the same token keeps working on its own repo.
+func TestAuth_MintedTokenIsScopedToItsRepo(t *testing.T) {
+	ts, signed := newRepoScopedTestServer(t)
+	alice := auth.Repo{Type: "model", ID: "alice/sec"}
+	readToken, _, err := signed.MintToken(auth.ScopeRead, "alice", alice, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeToken, _, err := signed.MintToken(auth.ScopeWrite, "alice", alice, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name, method, path, token string
+		body                      string
+		want                      int
+	}{
+		{"read own repo info", http.MethodGet, "/api/models/alice/sec/revision/main", readToken, "", http.StatusOK},
+		{"read other repo info", http.MethodGet, "/api/models/bob/private/revision/main", readToken, "", http.StatusForbidden},
+		{"read own tree", http.MethodGet, "/api/models/alice/sec/tree/main", readToken, "", http.StatusOK},
+		{"read other tree", http.MethodGet, "/api/models/bob/private/tree/main", readToken, "", http.StatusForbidden},
+		{"resolve own repo", http.MethodHead, "/alice/sec/resolve/main/missing.bin", readToken, "", http.StatusNotFound},
+		{"resolve other repo", http.MethodHead, "/bob/private/resolve/main/missing.bin", readToken, "", http.StatusForbidden},
+		{"mint token for own repo", http.MethodGet, "/api/models/alice/sec/xet-read-token/main", readToken, "", http.StatusOK},
+		{"mint token for other repo", http.MethodGet, "/api/models/bob/private/xet-read-token/main", readToken, "", http.StatusForbidden},
+		{"commit own repo", http.MethodPost, "/api/models/alice/sec/commit/main", writeToken, `{"key":"header","value":{}}` + "\n", http.StatusOK},
+		{"commit other repo", http.MethodPost, "/api/models/bob/private/commit/main", writeToken, `{"key":"header","value":{}}` + "\n", http.StatusForbidden},
+		{"preupload other repo", http.MethodPost, "/api/models/bob/private/preupload/main", writeToken, `{"files":[]}`, http.StatusForbidden},
+		{"branch other repo", http.MethodPost, "/api/models/bob/private/branch/dev", writeToken, "", http.StatusForbidden},
+		{"lfs batch other repo", http.MethodPost, "/bob/private.git/info/lfs/objects/batch", writeToken, `{"operation":"upload","transfers":["xet"],"objects":[]}`, http.StatusForbidden},
+		{"lfs batch own repo", http.MethodPost, "/alice/sec.git/info/lfs/objects/batch", writeToken, `{"operation":"upload","transfers":["xet"],"objects":[]}`, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, ok := doWithAuth(t, tc.method, ts.URL+tc.path, "Bearer "+tc.token, strings.NewReader(tc.body))
+			if !ok {
+				t.Fatal("request rejected client-side")
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body = %s", resp.StatusCode, tc.want, body)
+			}
+		})
+	}
+
+	// Repo creation is namespace-scoped rather than exact-repo-scoped: a
+	// token for alice/sec may create alice/new, but not carol/x.
+	for _, tc := range []struct {
+		name, body string
+		want       int
+	}{
+		{"create inside namespace", `{"name":"new","organization":"alice","type":"model"}`, http.StatusOK},
+		{"create outside namespace", `{"name":"x","organization":"carol","type":"model"}`, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, ok := doWithAuth(t, http.MethodPost, ts.URL+"/api/repos/create", "Bearer "+writeToken, strings.NewReader(tc.body))
+			if !ok {
+				t.Fatal("request rejected client-side")
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body = %s", resp.StatusCode, tc.want, body)
+			}
+		})
+	}
+
+	// The shared secret remains the operator credential: it still reaches
+	// every repo and namespace.
+	resp, ok := doWithAuth(t, http.MethodPost, ts.URL+"/api/repos/create", "Bearer "+testFixtureToken, strings.NewReader(`{"name":"x","organization":"carol","type":"model"}`))
+	if !ok {
+		t.Fatal("request rejected client-side")
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("shared secret create outside namespace: status = %d, want 200", resp.StatusCode)
+	}
+	resp, ok = doWithAuth(t, http.MethodGet, ts.URL+"/api/models/bob/private/revision/main", "Bearer "+testFixtureToken, nil)
+	if !ok {
+		t.Fatal("request rejected client-side")
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("shared secret other repo read: status = %d, want 200", resp.StatusCode)
 	}
 }

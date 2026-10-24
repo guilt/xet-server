@@ -64,28 +64,6 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, uploadShardResponse{Result: 1})
 }
 
-// dedupShardBody returns the bytes GET /v1/chunks/{prefix}/{hash} hands a
-// client for shard: a complete shard FILE, with lookup tables and a
-// version-1 footer. Real clients upload shards with the footer and
-// lookup tables stripped (header.FooterSize == 0; see ReadShard), but
-// what they download from the global-dedup endpoint they load with
-// MDBShardInfo::load_from_reader, which seeks to a footer at EOF and
-// refuses anything but footer version 1 ("Expected footer version 1,
-// got 0"). Serving the uploaded bytes back unchanged therefore only ever
-// worked for a client that never needed them - one deduplicating against
-// its own local shard cache. A footer-carrying body is returned as is.
-// The HMAC key is left zero, so the client matches raw chunk hashes.
-func dedupShardBody(shard *shardformat.Shard, body []byte) ([]byte, error) {
-	if shard.Header.FooterSize != 0 {
-		return body, nil
-	}
-	var buf bytes.Buffer
-	if _, err := shardformat.WriteShard(&buf, shard.Files, shard.Xorbs); err != nil {
-		return nil, fmt.Errorf("rebuild shard with footer: %w", err)
-	}
-	return buf.Bytes(), nil
-}
-
 // IngestShard parses body as a serialized shard and merges its
 // file-reconstruction entries into this server's in-memory fileRecon
 // index (keyed by file hash), and indexes every chunk hash referenced by
@@ -155,19 +133,18 @@ func (s *Server) indexShard(body []byte, shardHash merklehash.Hash) error {
 	s.fileReconMu.Unlock()
 
 	// Every chunk in this shard maps to THIS shard's own content-address
-	// hash, and the shard body is stored once under that same hash - the
-	// dedup layout snapshot memory-blowup fix relies on (see
-	// chunkHashToShard's doc comment). ComputeDataHash is content-addressed,
-	// so an identical shard body (same content, uploaded twice) resolves
-	// to the same entry with no duplication of storage.
-	served, err := dedupShardBody(shard, body)
-	if err != nil {
-		return err
-	}
+	// hash, and the raw uploaded shard body is stored once under that
+	// same hash - the dedup layout snapshot memory-blowup fix relies on
+	// (see chunkHashToShard's doc comment). ComputeDataHash is
+	// content-addressed, so an identical shard body (same content,
+	// uploaded twice) resolves to the same entry with no duplication of
+	// storage. The raw body is what the chunk index is keyed against;
+	// dedupAnswer rebuilds a keyed, footer-carrying answer from it on
+	// every query (see dedupAnswer), so no keyed body is ever stored.
 	var chunkCount int
 	s.chunkDedupMu.Lock()
 	if _, exists := s.shardBodies[shardHash]; !exists {
-		s.shardBodies[shardHash] = served
+		s.shardBodies[shardHash] = body
 	}
 	if _, exists := s.shardIndexedAt[shardHash]; !exists {
 		// Kept across Collect's rebuild, so a collection does not make

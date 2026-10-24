@@ -123,6 +123,17 @@ func (s *Server) FreshXetTokenFor(ctx context.Context, presentedToken string) (s
     this can never widen anyone's access - it only restores access the client
     already held.
 
+func (s *Server) MissingXorbs(context.Context, merklehash.Hash) ([]merklehash.Hash, error)
+    MissingXorbs completes casInfo alongside ReconstructFile; the proxy holds no
+    xorbs, so the answer is the same "not served here".
+
+func (s *Server) ReconstructFile(context.Context, merklehash.Hash, int64, int64, io.Writer) error
+    ReconstructFile completes casInfo for hubserver's git-lfs download bridge,
+    which needs a CAS that can assemble a file from xorbs. This proxy
+    holds no xorbs of its own (its CAS side is a pass-through cache, see
+    internal/proxycas), so the bridge is not available through it: point git-lfs
+    at a real xetd instead.
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) SetAuthenticator(a auth.Authenticator)

@@ -223,7 +223,7 @@ func TestCollect_KeepsWhatTheKeepSetReaches(t *testing.T) {
 	// Dedup: a chunk of the shared xorb is still answered, and the
 	// answer no longer advertises the deleted xorb; a chunk of the
 	// deleted xorb is unknown.
-	answer, known := f.srv.dedupAnswer(f.chunkInXS)
+	answer, known, _ := f.srv.dedupAnswer(f.chunkInXS)
 	if !known {
 		t.Fatal("chunk in the shared xorb is no longer known")
 	}
@@ -236,7 +236,7 @@ func TestCollect_KeepsWhatTheKeepSetReaches(t *testing.T) {
 			t.Error("dedup answer still advertises the deleted xorb")
 		}
 	}
-	if _, known := f.srv.dedupAnswer(f.chunkInX2); known {
+	if _, known, _ := f.srv.dedupAnswer(f.chunkInX2); known {
 		t.Error("chunk of the deleted xorb is still answered")
 	}
 	// The shard dir: bob's original is gone, its rewrite is there under
@@ -271,7 +271,7 @@ func TestCollect_KeepsWhatTheKeepSetReaches(t *testing.T) {
 		if _, err := reconstruct(t, restarted, f.fileB, len(f.contentB)); !errors.Is(err, ErrUnknownFile) {
 			t.Errorf("%s restart: file B err = %v, want ErrUnknownFile", mode, err)
 		}
-		if _, known := restarted.dedupAnswer(f.chunkInX2); known {
+		if _, known, _ := restarted.dedupAnswer(f.chunkInX2); known {
 			t.Errorf("%s restart: chunk of the deleted xorb is answered again", mode)
 		}
 	}
@@ -305,7 +305,7 @@ func TestCollect_GraceProtectsRecentlyAdvertisedXorbs(t *testing.T) {
 	f.backdate(t, 48*time.Hour)
 	// A dedup answer for a chunk of the shared xorb advertises XS and
 	// every xorb of both files; the orphan is never advertised.
-	if _, known := f.srv.dedupAnswer(f.chunkInXS); !known {
+	if _, known, _ := f.srv.dedupAnswer(f.chunkInXS); !known {
 		t.Fatal("fixture: shared chunk unknown")
 	}
 	report, err := f.srv.Collect(context.Background(), GCOptions{Grace: 24 * time.Hour})
@@ -382,7 +382,7 @@ func TestDedupAnswer_ExpiresAndMarksXorbsAccessed(t *testing.T) {
 	f := newGCFixture(t)
 	f.backdate(t, 48*time.Hour)
 	before := time.Now()
-	answer, known := f.srv.dedupAnswer(f.chunkInXS)
+	answer, known, _ := f.srv.dedupAnswer(f.chunkInXS)
 	if !known {
 		t.Fatal("shared chunk unknown")
 	}
@@ -468,7 +468,7 @@ func TestGCHandler_AdminOnlyExtraKeepAndAfterCollect(t *testing.T) {
 	defer ts.Close()
 
 	// A minted write token (what every client holds) is refused.
-	minted, _, err := signed.MintToken(auth.ScopeWrite, "alice", time.Hour)
+	minted, _, err := signed.MintToken(auth.ScopeWrite, "alice", auth.Repo{Type: "model", ID: "alice/gc"}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

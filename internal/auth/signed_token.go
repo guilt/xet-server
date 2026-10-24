@@ -13,14 +13,17 @@ import (
 	"time"
 )
 
-// TokenMinter issues short-lived bearer tokens carrying a scope and a
-// subject. hubserver uses it to answer the xet-{read,write}-token routes
-// and to put a token into every git-lfs batch action it hands out, so
-// the CAS side can authenticate those requests without the client ever
-// seeing the operator's shared secret.
+// TokenMinter issues short-lived bearer tokens carrying a scope, a
+// subject, and a repo binding. hubserver uses it to answer the
+// xet-{read,write}-token routes and to put a token into every git-lfs
+// batch action it hands out, so the CAS side can authenticate those
+// requests without the client ever seeing the operator's shared secret.
 type TokenMinter interface {
-	// MintToken returns a token granting scope to subject until exp.
-	MintToken(scope Scope, subject string, ttl time.Duration) (token string, exp time.Time, err error)
+	// MintToken returns a token granting scope to subject for repo until
+	// exp. A zero repo mints an unscoped token; Hub routes always pass a
+	// real repo, and a minted token is rejected on any Hub route whose
+	// repo it does not match (see AllowsRepo).
+	MintToken(scope Scope, subject string, repo Repo, ttl time.Duration) (token string, exp time.Time, err error)
 }
 
 // URLTokenVerifier is implemented by an Authenticator that accepts a
@@ -47,10 +50,16 @@ type URLTokenVerifier interface {
 //     which is what names the owner of a git-lfs lock.
 //   - Authorization: Bearer <minted token>     - a token this same secret
 //     minted via MintToken: HMAC-signed, scoped (read or write), bound to
-//     a subject, and expiring. This is what the Hub shim hands to
-//     hf_xet / git-xet for the CAS, and what it puts on git-lfs download
-//     hrefs. Also accepted as the password of a Basic credential, since
-//     some clients can only send Basic.
+//     a subject, expiring, and scoped to one repository. This is what the
+//     Hub shim hands to hf_xet / git-xet for the CAS, and what it puts on
+//     git-lfs download hrefs. Also accepted as the password of a Basic
+//     credential, since some clients can only send Basic.
+//
+// The repository binding is part of the MAC, not a separate check: a
+// token minted for alice/one cannot be edited into one for bob/two, and
+// Hub routes reject it when the repo in the URL does not match (see
+// AllowsRepo). Tokens minted before this field existed (xst1) are refused
+// outright rather than accepted unscoped.
 //
 // Minted tokens are stateless: any process holding the secret can verify
 // one, so a CAS and a Hub shim in separate processes (or a restarted one)
@@ -68,17 +77,22 @@ func NewSignedTokenAuth(secret string) *SignedTokenAuth {
 }
 
 // mintedTokenPrefix versions the token format so a future change to the
-// layout can coexist with tokens minted before it.
-const mintedTokenPrefix = "xst1"
+// layout can coexist with tokens minted before it. xst2 added the repo
+// fields; xst1 tokens are not accepted, since accepting an unscoped token
+// would reintroduce exactly the cross-repo access this version prevents.
+const mintedTokenPrefix = "xst2"
 
 // MintToken implements TokenMinter. Layout (dot-separated, every field
-// free of dots by construction):
+// free of dots by construction - repo type/id are hex-encoded):
 //
-//	xst1.<exp unix seconds>.<scope>.<hex(subject)>.<hex(HMAC-SHA256)>
+//	xst2.<exp unix seconds>.<scope>.<hex(subject)>.<hex(repo type)>.<hex(repo id)>.<hex(HMAC-SHA256)>
 //
-// The MAC covers the prefix, expiry, scope, and subject, so none of them
-// can be altered without the secret.
-func (a *SignedTokenAuth) MintToken(scope Scope, subject string, ttl time.Duration) (string, time.Time, error) {
+// The MAC covers the prefix, expiry, scope, subject, repo type, and repo
+// ID, so none of them can be altered without the secret. A zero repo
+// produces the empty strings in the two repo fields; that shape is only
+// used for the URL token the CAS mints when the caller authenticated
+// with the shared secret itself (which is already unrestricted).
+func (a *SignedTokenAuth) MintToken(scope Scope, subject string, repo Repo, ttl time.Duration) (string, time.Time, error) {
 	if len(a.secret) == 0 {
 		return "", time.Time{}, errors.New("auth: cannot mint a token without a secret")
 	}
@@ -89,13 +103,15 @@ func (a *SignedTokenAuth) MintToken(scope Scope, subject string, ttl time.Durati
 		return "", time.Time{}, errors.New("auth: token ttl must be positive")
 	}
 	exp := time.Now().Add(ttl).Truncate(time.Second)
-	payload := mintedPayload(exp.Unix(), scope, subject)
+	payload := mintedPayload(exp.Unix(), scope, subject, repo)
 	mac := a.mac(payload)
 	return payload + "." + hex.EncodeToString(mac), exp, nil
 }
 
-func mintedPayload(exp int64, scope Scope, subject string) string {
-	return mintedTokenPrefix + "." + strconv.FormatInt(exp, 10) + "." + string(scope) + "." + hex.EncodeToString([]byte(subject))
+func mintedPayload(exp int64, scope Scope, subject string, repo Repo) string {
+	return mintedTokenPrefix + "." + strconv.FormatInt(exp, 10) + "." + string(scope) + "." +
+		hex.EncodeToString([]byte(subject)) + "." + hex.EncodeToString([]byte(repo.Type)) + "." +
+		hex.EncodeToString([]byte(repo.ID))
 }
 
 func (a *SignedTokenAuth) mac(payload string) []byte {
@@ -116,7 +132,7 @@ func (a *SignedTokenAuth) VerifyURLToken(token string) (Principal, error) {
 // token (wrong shape, bad MAC, expired).
 func (a *SignedTokenAuth) verifyMinted(token string) (Principal, error) {
 	parts := strings.Split(token, ".")
-	if len(parts) != 5 || parts[0] != mintedTokenPrefix {
+	if len(parts) != 7 || parts[0] != mintedTokenPrefix {
 		return nil, ErrUnauthenticated
 	}
 	exp, err := strconv.ParseInt(parts[1], 10, 64)
@@ -131,18 +147,27 @@ func (a *SignedTokenAuth) verifyMinted(token string) (Principal, error) {
 	if err != nil {
 		return nil, ErrUnauthenticated
 	}
-	gotMAC, err := hex.DecodeString(parts[4])
+	repoType, err := hex.DecodeString(parts[4])
 	if err != nil {
 		return nil, ErrUnauthenticated
 	}
-	payload := mintedPayload(exp, scope, string(subjectBytes))
+	repoID, err := hex.DecodeString(parts[5])
+	if err != nil {
+		return nil, ErrUnauthenticated
+	}
+	gotMAC, err := hex.DecodeString(parts[6])
+	if err != nil {
+		return nil, ErrUnauthenticated
+	}
+	repo := Repo{Type: string(repoType), ID: string(repoID)}
+	payload := mintedPayload(exp, scope, string(subjectBytes), repo)
 	if !hmac.Equal(gotMAC, a.mac(payload)) {
 		return nil, ErrUnauthenticated
 	}
 	if time.Now().Unix() > exp {
 		return nil, ErrUnauthenticated
 	}
-	return &scopedPrincipal{subject: string(subjectBytes), scope: scope}, nil
+	return &scopedPrincipal{subject: string(subjectBytes), scope: scope, repo: repo}, nil
 }
 
 // Authenticate implements Authenticator; see the type's doc comment for
@@ -181,9 +206,14 @@ const SharedSecretSubject = "shared-secret"
 type scopedPrincipal struct {
 	subject string
 	scope   Scope
+	repo    Repo
 }
 
 func (p *scopedPrincipal) Subject() string { return p.subject }
+
+// Repo implements RepoScopedPrincipal. It is the zero Repo for the shared
+// secret (unrestricted) and the token's bound repo for a minted token.
+func (p *scopedPrincipal) Repo() Repo { return p.repo }
 
 func (p *scopedPrincipal) HasScope(scope Scope) bool {
 	switch scope {

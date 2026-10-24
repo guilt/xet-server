@@ -26,7 +26,13 @@ type createRepoResponse struct {
 // registers a repo (this server has no notion of "already exists" beyond
 // creating the in-memory repoState on first touch, so repeat calls with
 // the same name are harmless no-ops).
-func (s *Server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
+//
+// Repo creation is the one route whose target is not already named in the
+// URL, so authorization cannot compare it to the token's repo directly:
+// a repo-scoped write token may create only inside its own namespace, and
+// creating in a different namespace requires the shared secret's admin
+// scope (see auth.AllowsRepoCreate).
+func (s *Server) handleCreateRepo(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	var req createRepoRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpErrorJSON(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -44,6 +50,11 @@ func (s *Server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	repoID := req.Name
 	if req.Organization != "" {
 		repoID = req.Organization + "/" + req.Name
+	}
+	repo := auth.Repo{Type: repoType, ID: repoID}
+	if !auth.AllowsRepoCreate(principal, repo) {
+		httpErrorJSON(w, "credential is not allowed to create repositories outside its namespace", http.StatusForbidden)
+		return
 	}
 
 	s.getOrCreateRepo(repoType, repoID)
@@ -166,13 +177,14 @@ type xetTokenResponse struct {
 // (huggingface_hub's parse_xet_connection_info_from_headers, used on the
 // resolve/download path). The token comes from s.minter, scoped to the
 // route (read for xet-read-token, write for xet-write-token) and bound to
-// the authenticated caller's subject; with the default randomTokenMinter
-// it is a fresh random string only a no-auth CAS accepts, matching this
-// server's behavior before tokens carried any meaning.
+// the authenticated caller's subject and bound to this repo; with the
+// default randomTokenMinter it is a fresh random string only a no-auth CAS
+// accepts, matching this server's behavior before tokens carried any
+// meaning.
 func (s *Server) handleXetToken(w http.ResponseWriter, r *http.Request, repoType, repoID string, scope auth.Scope, subject string) {
 	s.getOrCreateRepo(repoType, repoID)
 
-	token, exp, err := s.mintToken(scope, subject)
+	token, exp, err := s.mintToken(scope, subject, auth.Repo{Type: repoType, ID: repoID})
 	if err != nil {
 		httpErrorJSON(w, "generate token: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -192,8 +204,8 @@ func (s *Server) handleXetToken(w http.ResponseWriter, r *http.Request, repoType
 // mintToken is the one place this server asks its minter for a CAS
 // token, so the ttl and error handling are uniform across the token
 // routes and the git-lfs batch actions.
-func (s *Server) mintToken(scope auth.Scope, subject string) (string, time.Time, error) {
-	return s.minter.MintToken(scope, subject, s.tokenTTL)
+func (s *Server) mintToken(scope auth.Scope, subject string, repo auth.Repo) (string, time.Time, error) {
+	return s.minter.MintToken(scope, subject, repo, s.tokenTTL)
 }
 
 // randomTokenMinter is the default auth.TokenMinter: a random 32-hex
@@ -203,7 +215,7 @@ func (s *Server) mintToken(scope auth.Scope, subject string) (string, time.Time,
 // whenever a shared secret is configured).
 type randomTokenMinter struct{}
 
-func (randomTokenMinter) MintToken(scope auth.Scope, subject string, ttl time.Duration) (string, time.Time, error) {
+func (randomTokenMinter) MintToken(scope auth.Scope, subject string, repo auth.Repo, ttl time.Duration) (string, time.Time, error) {
 	token, err := randomToken()
 	if err != nil {
 		return "", time.Time{}, err

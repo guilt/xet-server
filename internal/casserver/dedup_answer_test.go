@@ -117,8 +117,8 @@ func TestChunkDedup_AnswerCoversTheFile(t *testing.T) {
 	check := func(t *testing.T, ts *httptest.Server, chunk merklehash.Hash, wantXorbs []merklehash.Hash) {
 		t.Helper()
 		shard := fetchDedupShard(t, ts, chunk)
-		if shard.Footer.Version != 1 || !shard.Footer.ChunkHashHMACKey.IsZero() {
-			t.Fatalf("answer: footer v%d hmacZero=%v", shard.Footer.Version, shard.Footer.ChunkHashHMACKey.IsZero())
+		if shard.Footer.Version != 1 || shard.Footer.ChunkHashHMACKey.IsZero() {
+			t.Fatalf("answer: footer v%d hmacZero=%v, want v1 with a non-zero key", shard.Footer.Version, shard.Footer.ChunkHashHMACKey.IsZero())
 		}
 		if len(shard.Xorbs) != len(wantXorbs) {
 			t.Fatalf("answer lists xorbs %v, want %d xorbs: the file's other xorbs are on the server and the client will not ask again", xorbHashes(shard), len(wantXorbs))

@@ -43,19 +43,19 @@ const (
 )
 
 // handleLFSLocks dispatches POST (create) and GET (list) on /locks.
-func (s *Server) handleLFSLocks(w http.ResponseWriter, r *http.Request, repoID string) {
+func (s *Server) handleLFSLocks(w http.ResponseWriter, r *http.Request, repo auth.Repo) {
 	switch r.Method {
 	case http.MethodPost:
-		s.handleLFSLockCreate(w, r, repoID)
+		s.handleLFSLockCreate(w, r, repo)
 	case http.MethodGet:
-		s.handleLFSLockList(w, r, repoID)
+		s.handleLFSLockList(w, r, repo)
 	default:
 		lfsError(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *Server) handleLFSLockCreate(w http.ResponseWriter, r *http.Request, repoID string) {
-	principal, ok := s.lfsAuthenticate(w, r, auth.ScopeWrite)
+func (s *Server) handleLFSLockCreate(w http.ResponseWriter, r *http.Request, repo auth.Repo) {
+	principal, ok := s.lfsAuthenticate(w, r, auth.ScopeWrite, repo)
 	if !ok {
 		return
 	}
@@ -77,7 +77,7 @@ func (s *Server) handleLFSLockCreate(w http.ResponseWriter, r *http.Request, rep
 		lfsError(w, "generate lock id: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	lock, existing, err := s.locks.Create(repoID, lfsLock{
+	lock, existing, err := s.locks.Create(repo.ID, lfsLock{
 		ID:       id,
 		Path:     req.Path,
 		LockedAt: time.Now().UTC().Format(time.RFC3339),
@@ -127,14 +127,14 @@ func page(locks []*lfsLock, cursor string, limit int) ([]*lfsLock, string) {
 	return locks[offset:end], next
 }
 
-func (s *Server) handleLFSLockList(w http.ResponseWriter, r *http.Request, repoID string) {
-	if _, ok := s.lfsAuthenticate(w, r, auth.ScopeRead); !ok {
+func (s *Server) handleLFSLockList(w http.ResponseWriter, r *http.Request, repo auth.Repo) {
+	if _, ok := s.lfsAuthenticate(w, r, auth.ScopeRead, repo); !ok {
 		return
 	}
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 
-	all, err := s.locks.List(repoID)
+	all, err := s.locks.List(repo.ID)
 	if err != nil {
 		lfsError(w, "list locks: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -157,12 +157,12 @@ func (s *Server) handleLFSLockList(w http.ResponseWriter, r *http.Request, repoI
 	}{locks, next})
 }
 
-func (s *Server) handleLFSLocksVerify(w http.ResponseWriter, r *http.Request, repoID string) {
+func (s *Server) handleLFSLocksVerify(w http.ResponseWriter, r *http.Request, repo auth.Repo) {
 	if r.Method != http.MethodPost {
 		lfsError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	principal, ok := s.lfsAuthenticate(w, r, auth.ScopeWrite)
+	principal, ok := s.lfsAuthenticate(w, r, auth.ScopeWrite, repo)
 	if !ok {
 		return
 	}
@@ -177,7 +177,7 @@ func (s *Server) handleLFSLocksVerify(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 
-	all, err := s.locks.List(repoID)
+	all, err := s.locks.List(repo.ID)
 	if err != nil {
 		lfsError(w, "list locks: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -199,12 +199,12 @@ func (s *Server) handleLFSLocksVerify(w http.ResponseWriter, r *http.Request, re
 	}{ours, theirs, next})
 }
 
-func (s *Server) handleLFSUnlock(w http.ResponseWriter, r *http.Request, repoID, id string) {
+func (s *Server) handleLFSUnlock(w http.ResponseWriter, r *http.Request, repo auth.Repo, id string) {
 	if r.Method != http.MethodPost {
 		lfsError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	principal, ok := s.lfsAuthenticate(w, r, auth.ScopeWrite)
+	principal, ok := s.lfsAuthenticate(w, r, auth.ScopeWrite, repo)
 	if !ok {
 		return
 	}
@@ -217,7 +217,7 @@ func (s *Server) handleLFSUnlock(w http.ResponseWriter, r *http.Request, repoID,
 		return
 	}
 
-	lock, err := s.locks.Lookup(repoID, id)
+	lock, err := s.locks.Lookup(repo.ID, id)
 	if err != nil {
 		lfsError(w, "look up lock: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -230,7 +230,7 @@ func (s *Server) handleLFSUnlock(w http.ResponseWriter, r *http.Request, repoID,
 		lfsError(w, "lock is owned by "+lock.Owner.Name+"; pass --force to remove another user's lock", http.StatusForbidden)
 		return
 	}
-	if err := s.locks.Remove(repoID, id); err != nil {
+	if err := s.locks.Remove(repo.ID, id); err != nil {
 		lfsError(w, "release lock: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
