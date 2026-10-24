@@ -4,8 +4,10 @@ package proxyhub
 // The one read endpoint that CANNOT delegate to Embedded - hubserver's
 // own xet-token handler mints a fake random token, worthless against
 // the real upstream CAS - so this package caches the real XetToken
-// value itself, independent of Embedded, under the same freshness+
-// fallback policy every other endpoint uses. See the package doc
+// value itself, independent of Embedded, under a token-specific freshness
+// policy: cache entries are keyed by the caller credential and an upstream
+// 401/403 is never hidden by a stale entry (see fetchTokenCache). See the
+// package doc
 // comment for why CasURL is rewritten while AccessToken passes through
 // unchanged, and why the real upstream CAS URL is ALSO tracked
 // separately in casURLCache regardless of this endpoint's own per-repo
@@ -14,6 +16,7 @@ package proxyhub
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -24,8 +27,8 @@ import (
 )
 
 // tokenSafetyMargin is how far in the future a cached xet token's exp must
-// still be for it to be served on the stale-fallback path (fetchOrServeCache
-// below). A token any closer to expiry than this - or already past it - is
+// still be for it to be served from cache (fetchTokenCache below). A token
+// any closer to expiry than this - or already past it - is
 // worthless: the first CAS request presenting it would be rejected with a 401
 // the client can't explain. This mirrors huggingface_hub's own 60s
 // XET_CONNECTION_INFO_SAFETY_PERIOD; xet-core's docs recommend at least 30s.
@@ -33,20 +36,20 @@ const tokenSafetyMargin = 60 * time.Second
 
 func (s *Server) handleXetToken(w http.ResponseWriter, r *http.Request, repoType, repoID, revision string, kind hfclient.XetTokenKind) {
 	cred := auth.CredentialFromRequest(r)
-	key := cacheKey(repoType, repoID, revision, strconv.Itoa(int(kind)))
+	// The caller's credential MUST be part of the key: two callers asking
+	// for the same repo/ref/kind get different upstream principals, and
+	// upstream tokens are bearer credentials for exactly one principal.
+	// Keying only by repo/ref/kind let any caller (including anonymous or
+	// wrong-token ones) receive a token another user had cached; see
+	// credentialFingerprint.
+	key := cacheKey(repoType, repoID, revision, strconv.Itoa(int(kind)), credentialFingerprint(r))
 
-	tok, err := fetchOrServeCache(s.NoCache, s.xetTokenCache, s.CacheTTL, key,
+	tok, err := fetchTokenCache(s.NoCache, s.xetTokenCache, s.CacheTTL, key,
 		func() (*hfclient.XetToken, error) {
 			callCtx, cancel := s.callContext(r)
 			defer cancel()
 			return s.Hub.GetXetToken(callCtx, cred, repoType, repoID, revision, kind)
 		},
-		// Stale-fallback guard: only serve a cached token that is still
-		// actually usable. Serving one whose exp has already passed hands
-		// the client a token the real CAS will reject with a 401 it can't
-		// explain, when a clean refresh error would at least fail loudly
-		// (and be retryable). See tokenSafetyMargin.
-		func(t *hfclient.XetToken) bool { return t != nil && t.Exp > time.Now().Add(tokenSafetyMargin).Unix() },
 	)
 	if err != nil {
 		writeUpstreamError(w, err)
@@ -68,7 +71,7 @@ func (s *Server) handleXetToken(w http.ResponseWriter, r *http.Request, repoType
 	// stale - is deliberate: a client handed a stale token and presenting
 	// it to the CAS is exactly the case the heal must be able to fix.
 	s.recordAccessToken(tok.AccessToken, tokenRecord{
-		cred: cred, repoType: repoType, repoID: repoID, revision: revision, kind: kind,
+		cred: cred, cacheKey: key, repoType: repoType, repoID: repoID, revision: revision, kind: kind,
 	})
 
 	rewritten := *tok
@@ -92,34 +95,52 @@ func (s *Server) UpstreamCASBaseURL() (string, bool) {
 	return value, present
 }
 
-// fetchOrServeCache implements the shared TTL-freshness-then-
-// stale-fallback policy for a VALUE cache (xetTokenCache/casURLCache -
-// the two caches in this package that still hold actual data, unlike
-// the struct{}-valued freshness trackers repo.go/tree.go/resolve.go
-// use against Embedded directly).
+// fetchTokenCache is the xet-token-specific cache policy. It is stricter
+// than the generic stale-fallback used for public metadata:
 //
-// staleUsable gates the stale-fallback path: when a live fetch fails but a
-// cached value exists, that value is only served if staleUsable says it's
-// still usable (nil means always usable - appropriate for the CAS URL, which
-// never expires). This lets a caller refuse to serve a cached value that is
-// technically present but has lost its reason to be served - an expired xet
-// token, for example - and surface the fetch error instead.
-func fetchOrServeCache[V any](noCache bool, cache *ttlCache[V], ttl time.Duration, key string, fetch func() (V, error), staleUsable func(V) bool) (V, error) {
+//   - An upstream 401/403 is never hidden behind a cached token. The
+//     credential in the cache key is the caller's own, so a wrong/expired
+//     credential gets its own (normally empty) entry and must see the
+//     upstream rejection, not a token minted for someone else.
+//   - A network/hang/malformed-JSON failure may still serve this same
+//     credential's cached, unexpired token - that is the proxy's offline
+//     resilience, and it cannot cross principals because the cache key
+//     includes the credential fingerprint.
+//   - A cached token within tokenSafetyMargin of expiry is treated as
+//     unusable even on the stale path, matching huggingface_hub's own
+//     freshness rule.
+func fetchTokenCache(noCache bool, cache *ttlCache[*hfclient.XetToken], ttl time.Duration, key string, fetch func() (*hfclient.XetToken, error)) (*hfclient.XetToken, error) {
 	if noCache {
 		return fetch()
 	}
-	if value, present, fresh := cache.Get(key, ttl); present && fresh {
+	if value, present, fresh := cache.Get(key, ttl); present && fresh && tokenUsable(value) {
 		return value, nil
 	}
 	value, err := fetch()
 	if err != nil {
-		if stale, present, _ := cache.Get(key, ttl); present && (staleUsable == nil || staleUsable(stale)) {
+		if isAuthFailure(err) {
+			return nil, err
+		}
+		if stale, present, _ := cache.Get(key, ttl); present && tokenUsable(stale) {
 			return stale, nil
 		}
-		return value, err
+		return nil, err
 	}
 	cache.Set(key, value)
 	return value, nil
+}
+
+func tokenUsable(t *hfclient.XetToken) bool {
+	return t != nil && t.Exp > time.Now().Add(tokenSafetyMargin).Unix()
+}
+
+// isAuthFailure reports whether err is an upstream 401/403. Those must
+// never be hidden by a stale cache - doing so is exactly how a caller
+// without access would receive another caller's token or private-repo
+// metadata instead of the rejection the Hub already made.
+func isAuthFailure(err error) bool {
+	var statusErr *hfclient.StatusError
+	return errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden)
 }
 
 // tokenRecord remembers the exact Hub call parameters (and the caller's
@@ -128,6 +149,7 @@ func fetchOrServeCache[V any](noCache bool, cache *ttlCache[V], ttl time.Duratio
 // same repo/ref (see FreshXetTokenFor).
 type tokenRecord struct {
 	cred     auth.CredentialHelper
+	cacheKey string
 	repoType string
 	repoID   string
 	revision string
@@ -187,7 +209,7 @@ func (s *Server) FreshXetTokenFor(ctx context.Context, presentedToken string) (s
 	// Keep the caches the rest of this proxy reads consistent with the
 	// replacement token: the xet-token cache entry (so a future refresh
 	// serves the fresh value) and the upstream CAS URL routing state.
-	s.xetTokenCache.Set(cacheKey(rec.repoType, rec.repoID, rec.revision, strconv.Itoa(int(rec.kind))), fresh)
+	s.xetTokenCache.Set(rec.cacheKey, fresh)
 	if fresh.CasURL != "" {
 		s.casURLCache.Set(casURLCacheKey, fresh.CasURL)
 	}

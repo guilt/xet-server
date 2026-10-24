@@ -140,6 +140,10 @@ type Server struct {
 	fileSizeMu        sync.RWMutex
 	fileSizeByXetHash map[merklehash.Hash]int64
 
+	// configMu guards authenticator/rateLimiter, read on every request
+	// while their setters may replace them at runtime.
+	configMu sync.RWMutex
+
 	authenticator auth.Authenticator
 
 	// rateLimiter, if set via SetRateLimiter, gates every route in this
@@ -256,7 +260,9 @@ func (s *Server) recordFileSize(xetHash merklehash.Hash, size int64) {
 // reasoning applies here) AND forwards to Embedded, so its own scope
 // checks stay in sync.
 func (s *Server) SetAuthenticator(a auth.Authenticator) {
+	s.configMu.Lock()
 	s.authenticator = a
+	s.configMu.Unlock()
 	s.Embedded.SetAuthenticator(a)
 }
 
@@ -268,14 +274,28 @@ func (s *Server) SetAuthenticator(a auth.Authenticator) {
 // separately via s.Embedded.SetUploadRateLimiter, same as
 // proxycas.Server.SetRateLimiter's contract.
 func (s *Server) SetRateLimiter(l *ratelimit.Limiter) {
+	s.configMu.Lock()
 	s.rateLimiter = l
+	s.configMu.Unlock()
+}
+
+func (s *Server) authenticatorSnapshot() auth.Authenticator {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.authenticator
+}
+
+func (s *Server) rateLimiterSnapshot() *ratelimit.Limiter {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.rateLimiter
 }
 
 // requireScope authenticates r against s.authenticator and checks for
 // scope, writing a 401/403 and returning false if the request should
 // not proceed to any upstream fetch/ingest.
 func (s *Server) requireScope(w http.ResponseWriter, r *http.Request, scope auth.Scope) bool {
-	principal, err := s.authenticator.Authenticate(r)
+	principal, err := s.authenticatorSnapshot().Authenticate(r)
 	if err != nil {
 		if errors.Is(err, auth.ErrUnauthenticated) {
 			httpErrorJSON(w, "unauthenticated: "+err.Error(), http.StatusUnauthorized)
@@ -306,11 +326,12 @@ func (s *Server) gate(w http.ResponseWriter, r *http.Request, scope auth.Scope) 
 	if !s.requireScope(w, r, scope) {
 		return false
 	}
-	if s.rateLimiter == nil {
+	limiter := s.rateLimiterSnapshot()
+	if limiter == nil {
 		return true
 	}
-	if !s.rateLimiter.AllowRequest(r) {
-		w.Header().Set("Retry-After", strconv.Itoa(s.rateLimiter.RetryAfterSecondsForRequest(r)))
+	if !limiter.AllowRequest(r) {
+		w.Header().Set("Retry-After", strconv.Itoa(limiter.RetryAfterSecondsForRequest(r)))
 		httpErrorJSON(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return false
 	}

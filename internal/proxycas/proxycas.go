@@ -58,6 +58,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"sync"
 
 	"github.com/guilt/xet-server/internal/auth"
 	"github.com/guilt/xet-server/internal/casserver"
@@ -94,6 +95,12 @@ type Server struct {
 	// request is relayed live to upstream via internal/hfclient, and
 	// Embedded is never read or written. Off by default.
 	NoCache bool
+
+	// configMu guards authenticator/rateLimiter, which gate reads on every
+	// request while SetAuthenticator/SetRateLimiter may replace them at
+	// runtime. A plain field would be a data race under -race even though
+	// the values are interface/pointer-sized.
+	configMu sync.RWMutex
 
 	// authenticator mirrors whatever was last passed to SetAuthenticator
 	// (which also forwards it to Embedded, so casserver's own handlers
@@ -134,7 +141,13 @@ func New(xorbs storage.Store) *Server {
 // scope checks - the ones that actually run once a request is
 // delegated - stay in sync.
 func (s *Server) SetAuthenticator(a auth.Authenticator) {
+	s.configMu.Lock()
 	s.authenticator = a
+	s.configMu.Unlock()
+	// Embedded's setter rebuilds its route table, so that half must still
+	// be called before the embedded server starts serving (see
+	// casserver.Server.SetAuthenticator). This package's own gate is safe
+	// to update at runtime.
 	s.Embedded.SetAuthenticator(a)
 }
 
@@ -150,7 +163,24 @@ func (s *Server) SetAuthenticator(a auth.Authenticator) {
 // caller wanting both should configure separately via
 // s.Embedded.SetUploadRateLimiter.
 func (s *Server) SetRateLimiter(l *ratelimit.Limiter) {
+	s.configMu.Lock()
 	s.rateLimiter = l
+	s.configMu.Unlock()
+}
+
+// authenticatorSnapshot returns the configured Authenticator under the
+// config lock. The interface itself is immutable, so the caller may use
+// it after the lock is released.
+func (s *Server) authenticatorSnapshot() auth.Authenticator {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.authenticator
+}
+
+func (s *Server) rateLimiterSnapshot() *ratelimit.Limiter {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.rateLimiter
 }
 
 // requireScope authenticates r against s.authenticator and checks for
@@ -160,7 +190,8 @@ func (s *Server) SetRateLimiter(l *ratelimit.Limiter) {
 // doc comment for why the check has to happen here too, not only once
 // (and later) at the point of delegating to Embedded.
 func (s *Server) requireScope(w http.ResponseWriter, r *http.Request, scope auth.Scope) bool {
-	principal, err := s.authenticator.Authenticate(r)
+	authenticator := s.authenticatorSnapshot()
+	principal, err := authenticator.Authenticate(r)
 	if err != nil {
 		if errors.Is(err, auth.ErrUnauthenticated) {
 			httpError(w, "unauthenticated: "+err.Error(), http.StatusUnauthorized)
@@ -215,8 +246,8 @@ func (s *Server) gate(scope auth.Scope, next http.HandlerFunc) http.HandlerFunc 
 		if !s.requireScope(w, r, scope) {
 			return
 		}
-		if s.rateLimiter != nil {
-			s.rateLimiter.Middleware(http.HandlerFunc(next)).ServeHTTP(w, r)
+		if limiter := s.rateLimiterSnapshot(); limiter != nil {
+			limiter.Middleware(http.HandlerFunc(next)).ServeHTTP(w, r)
 			return
 		}
 		next(w, r)

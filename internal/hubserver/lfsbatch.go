@@ -323,7 +323,8 @@ func (s *Server) fillDownloadBatch(r *http.Request, resp *lfsBatchResponse, req 
 			return
 		}
 		token = t
-		expiresIn = int64(exp.Unix() - exp.Add(-s.tokenTTL).Unix())
+		_, ttl := s.minterSnapshot()
+		expiresIn = int64(exp.Unix() - exp.Add(-ttl).Unix())
 	}
 
 	for _, obj := range req.Objects {

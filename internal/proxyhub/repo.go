@@ -77,7 +77,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 // path (served from Embedded, whose repoInfoResponse always includes
 // it, currently always false - see hubserver.getOrCreateRepo).
 func (s *Server) handleRepoInfo(w http.ResponseWriter, r *http.Request, repoType, repoID, revision string) {
-	key := cacheKey(repoType, repoID, revision)
+	key := cacheKey(repoType, repoID, revision, credentialFingerprint(r))
 
 	if s.NoCache {
 		info, err := s.Hub.RepoInfo(r.Context(), auth.CredentialFromRequest(r), repoType, repoID, revision)
@@ -98,11 +98,14 @@ func (s *Server) handleRepoInfo(w http.ResponseWriter, r *http.Request, repoType
 	info, err := s.Hub.RepoInfo(callCtx, auth.CredentialFromRequest(r), repoType, repoID, revision)
 	cancel()
 	if err != nil {
-		if s.Embedded.HasRevision(repoType, repoID, revision) {
-			// Stale-fallback: upstream failed, but Embedded already has
-			// this revision from a previous successful fetch - serve it
-			// regardless of age, per the package doc comment's whole
-			// reason to exist.
+		// Stale-fallback only for a credential that has itself fetched this
+		// revision before. Embedded's data is global, but authorization is
+		// not: serving it to a different caller whose upstream request just
+		// failed (including 401/403 for a private repo) would leak another
+		// caller's private metadata. The freshness key includes
+		// credentialFingerprint, so "present" here means THIS credential
+		// previously succeeded.
+		if !isAuthFailure(err) && s.Embedded.HasRevision(repoType, repoID, revision) {
 			s.Embedded.ServeHTTP(w, r)
 			return
 		}

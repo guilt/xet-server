@@ -18,7 +18,7 @@ import (
 
 // handleListTree implements the endpoint described above.
 func (s *Server) handleListTree(w http.ResponseWriter, r *http.Request, repoType, repoID, revision, pathInRepo string) {
-	key := cacheKey(repoType, repoID, revision)
+	key := cacheKey(repoType, repoID, revision, credentialFingerprint(r))
 	cred := auth.CredentialFromRequest(r)
 
 	if s.NoCache {
@@ -38,7 +38,9 @@ func (s *Server) handleListTree(w http.ResponseWriter, r *http.Request, repoType
 
 	entries, err := s.Hub.ListTree(r.Context(), cred, repoType, repoID, revision)
 	if err != nil {
-		if s.Embedded.HasRevision(repoType, repoID, revision) {
+		// Only this credential's own prior successful fetch may back a
+		// stale serve - see handleRepoInfo's identical note.
+		if !isAuthFailure(err) && s.Embedded.HasRevision(repoType, repoID, revision) {
 			s.Embedded.ServeHTTP(w, r)
 			return
 		}

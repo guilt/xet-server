@@ -178,6 +178,14 @@ make test-race                  # unit tests under the race detector
 go test ./internal/shardformat/... -run '^$' -fuzz '^FuzzReadShard$' -fuzztime 60s
 ```
 
+On Windows, `-race` needs a **64-bit MinGW-w64 GCC 10 or newer** first on
+`PATH`. An old 32-bit MinGW (e.g. `i686-w64-mingw32` GCC 8) produces
+`exit status 0xc0000139`; newer Go releases do not fix that. A modern
+toolchain can be installed with `winget install
+BrechtSanders.WinLibs.POSIX.UCRT`, then point `CC` at its
+`x86_64-w64-mingw32-gcc.exe` (from a fresh shell so the updated `PATH`
+applies).
+
 `make test-fuzz` depends on `fuzz-seeds`, so the committed corpora (every
 previously-found crash) replay before any time is spent hunting for new
 inputs - if an old bug is back, you find out immediately rather than after

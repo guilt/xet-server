@@ -127,7 +127,7 @@ func writeLFSJSON(w http.ResponseWriter, code int, v any) {
 // lfsAuthenticate is authenticate with git-lfs shaped failures: the same
 // 401/403 split, but a {"message"} body and an LFS-Authenticate challenge.
 func (s *Server) lfsAuthenticate(w http.ResponseWriter, r *http.Request, scope auth.Scope, repo auth.Repo) (auth.Principal, bool) {
-	principal, err := s.authenticator.Authenticate(r)
+	principal, err := s.authenticatorSnapshot().Authenticate(r)
 	if err != nil {
 		if errors.Is(err, auth.ErrUnauthenticated) {
 			lfsError(w, "authentication required: "+err.Error(), http.StatusUnauthorized)

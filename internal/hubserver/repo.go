@@ -205,7 +205,8 @@ func (s *Server) handleXetToken(w http.ResponseWriter, r *http.Request, repoType
 // token, so the ttl and error handling are uniform across the token
 // routes and the git-lfs batch actions.
 func (s *Server) mintToken(scope auth.Scope, subject string, repo auth.Repo) (string, time.Time, error) {
-	return s.minter.MintToken(scope, subject, repo, s.tokenTTL)
+	minter, ttl := s.minterSnapshot()
+	return minter.MintToken(scope, subject, repo, ttl)
 }
 
 // randomTokenMinter is the default auth.TokenMinter: a random 32-hex

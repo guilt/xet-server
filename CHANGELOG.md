@@ -5,6 +5,40 @@ All notable changes to Xet Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-24
+
+Security-hardening release. Authorization-dependent proxy caches are now
+scoped to the caller, runtime configuration setters are synchronized, and
+the Windows `-race` test path is documented and working. Thanks to
+[Taylor Brown (@Tay-Tay)](https://github.com/Tay-Tay) for the garbage-collection patches
+and [@stubbi](https://github.com/stubbi) / [openxet](https://github.com/stubbi/openxet)
+for the independent implementation and security review.
+
+### Fixed
+
+- **Runtime configuration setters are race-free.** `proxycas`,
+  `proxyhub`, and `hubserver` now guard their `Authenticator`,
+  rate-limiter, token-minter, and token-TTL fields with a config lock.
+  Their setters are documented as usable while serving, but the previous
+  plain fields were read per request and written by the setters without
+  synchronization.
+
+### Security
+
+- **`xet-proxyd`: authorization-dependent caches are per-credential.** The
+  upstream xet-token cache key now includes a SHA-256 fingerprint of the
+  caller's `Authorization` header, alongside repo/ref/kind, so one caller's
+  read or write token can never be served to an anonymous or wrong-token
+  caller. Repo-info, tree, and resolve freshness keys are likewise scoped
+  to the credential, and an upstream 401/403 is never hidden behind a stale
+  cached token or private-repo metadata (other upstream failures still use
+  the offline stale fallback for the same credential). This closes the
+  token-cache isolation issue in the openxet report; the keyed, xorb-only
+  global-dedup answer issue from the same report was already fixed in
+  1.2.0. Token caches and the 401-heal index remain process-memory only;
+  a regression test asserts snapshots never contain an upstream access
+  token or the caller credential.
+
 ## [1.2.0] - 2026-10-24
 
 Full dataset handoff release. The pull-through proxy now caches shared-xorb

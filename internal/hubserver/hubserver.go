@@ -77,6 +77,11 @@ type Server struct {
 	mu    sync.RWMutex
 	repos map[repoKey]*repoState
 
+	// configMu guards authenticator/minter/tokenTTL, which handlers read
+	// while their setters may replace them at runtime (SetAuthenticator is
+	// explicitly documented safe to call at any time).
+	configMu sync.RWMutex
+
 	// authenticator gates every route per its required scope (see
 	// requireScope and each dispatch handler below). Defaults to
 	// auth.NoAuth{} - this server's pre-v0.8.0 behavior, unconditionally
@@ -183,7 +188,9 @@ const defaultTokenTTL = time.Hour
 // accepted there.
 func (s *Server) SetTokenMinter(m auth.TokenMinter) {
 	if m != nil {
+		s.configMu.Lock()
 		s.minter = m
+		s.configMu.Unlock()
 	}
 }
 
@@ -191,7 +198,9 @@ func (s *Server) SetTokenMinter(m auth.TokenMinter) {
 // Non-positive values are ignored.
 func (s *Server) SetTokenTTL(ttl time.Duration) {
 	if ttl > 0 {
+		s.configMu.Lock()
 		s.tokenTTL = ttl
+		s.configMu.Unlock()
 	}
 }
 
@@ -202,7 +211,21 @@ func (s *Server) SetTokenTTL(ttl time.Duration) {
 // inside each handler rather than registering one mux pattern per
 // logical endpoint, so there's no route table to rebuild.
 func (s *Server) SetAuthenticator(a auth.Authenticator) {
+	s.configMu.Lock()
 	s.authenticator = a
+	s.configMu.Unlock()
+}
+
+func (s *Server) authenticatorSnapshot() auth.Authenticator {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.authenticator
+}
+
+func (s *Server) minterSnapshot() (auth.TokenMinter, time.Duration) {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.minter, s.tokenTTL
 }
 
 // requireScope authenticates r against s.authenticator and checks for
@@ -241,7 +264,7 @@ func (s *Server) requireRepoScope(w http.ResponseWriter, r *http.Request, scope 
 // routes that need to know WHO passed (the token routes bind the minted
 // token to the caller's subject; git-lfs locks record it as the owner).
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, scope auth.Scope) (auth.Principal, bool) {
-	principal, err := s.authenticator.Authenticate(r)
+	principal, err := s.authenticatorSnapshot().Authenticate(r)
 	if err != nil {
 		if errors.Is(err, auth.ErrUnauthenticated) {
 			httpErrorJSON(w, "unauthenticated: "+err.Error(), http.StatusUnauthorized)

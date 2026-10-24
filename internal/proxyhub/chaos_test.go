@@ -265,7 +265,7 @@ func TestChaos_UpstreamDiesAfterFirstCallThenEveryRepeatStillSucceeds(t *testing
 // TestChaos_XetTokenUpstreamHangsAfterFirstCallStillServesStaleToken
 // covers the one endpoint that cannot fall back through Embedded at all
 // (see token.go): its stale fallback comes from xetTokenCache via
-// fetchOrServeCache, and must survive the same hung upstream - including
+// fetchTokenCache, and must survive the same hung upstream - including
 // still rewriting CasURL and passing the real AccessToken through.
 func TestChaos_XetTokenUpstreamHangsAfterFirstCallStillServesStaleToken(t *testing.T) {
 	hubTS := httptest.NewServer(hangAfterFirstCall(xetTokenHandler))

@@ -9,6 +9,9 @@ package proxyhub
 // stale-fallback policy.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +22,16 @@ import (
 // which repoID itself already contains.
 func cacheKey(parts ...string) string {
 	return strings.Join(parts, "\x00")
+}
+
+// credentialFingerprint identifies the caller's credential without storing
+// it: a SHA-256 of the exact Authorization header the request carried. The
+// empty header (anonymous) gets its own stable value. Cache entries whose
+// value depends on authorization include this in their key, so one caller's
+// upstream token or private-repo metadata can never be served to another.
+func credentialFingerprint(r *http.Request) string {
+	sum := sha256.Sum256([]byte(r.Header.Get("Authorization")))
+	return hex.EncodeToString(sum[:])
 }
 
 // ttlCache[V] is reused for two different purposes in this package:

@@ -849,6 +849,13 @@ Thank you to:
   [xet-core](https://github.com/huggingface/xet-core) (the real Rust
   implementation this project is wire-compatible with) - the ultimate
   source of truth every byte here was checked against.
+- [Taylor Brown (@Tay-Tay)](https://github.com/Tay-Tay) for the keep-set garbage-collection
+  patches (`xetd gc`, GC grace and keep semantics) integrated in v1.2.0.
+- [Jannes Stubbemann (@stubbi)](https://github.com/stubbi) and the
+  [openxet](https://github.com/stubbi/openxet) project for an independent
+  Xet protocol implementation and a thorough security review, which found
+  the token-cache isolation and unkeyed global-dedup issues fixed in
+  v1.3.0.
 - [jedisct1](https://github.com/jedisct1) for
   [zig-xet](https://github.com/jedisct1/zig-xet), an independent
   third-party reference implementation used to verify this project's own

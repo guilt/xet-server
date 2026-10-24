@@ -25,7 +25,7 @@ import (
 // key their state by repoType - mixing types there would look up the
 // wrong revisionState.
 func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request, repoType, repoID, revision, filename string) {
-	key := cacheKey(repoType, repoID, revision, filename)
+	key := cacheKey(repoType, repoID, revision, filename, credentialFingerprint(r))
 	cred := auth.CredentialFromRequest(r)
 
 	if s.NoCache {
@@ -51,7 +51,9 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request, repoType,
 	info, err := s.Hub.Resolve(callCtx, cred, repoType, repoID, revision, filename)
 	cancel()
 	if err != nil {
-		if s.Embedded.HasFile(repoType, repoID, revision, filename) {
+		// Only this credential's own prior successful fetch may back a
+		// stale serve - see handleRepoInfo's identical note.
+		if !isAuthFailure(err) && s.Embedded.HasFile(repoType, repoID, revision, filename) {
 			s.Embedded.ServeHTTP(w, r)
 			return
 		}
