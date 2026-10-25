@@ -144,8 +144,11 @@ func TestBuildV2_GroupsMultipleTermsUnderOneXorb(t *testing.T) {
 	if len(fetches) != 1 {
 		t.Fatalf("got %d XorbMultiRangeFetch entries, want 1 (grouped under one URL)", len(fetches))
 	}
-	if len(fetches[0].Ranges) != 2 {
-		t.Errorf("got %d ranges, want 2 (both terms grouped under the same xorb)", len(fetches[0].Ranges))
+	if len(fetches[0].Ranges) != 1 {
+		t.Fatalf("got %d ranges, want 1 (adjacent 0-1 and 1-2 terms merge into 0-2)", len(fetches[0].Ranges))
+	}
+	if got := fetches[0].Ranges[0]; got.Chunks != (IndexRange{Start: 0, End: 2}) || got.Bytes != (ByteRange{Start: 0, End: 109}) {
+		t.Errorf("merged range = %+v, want chunks 0-2 bytes 0-109", got)
 	}
 	// The URL builder must only be called once per distinct xorb hash,
 	// even though two terms reference it - the whole point of V2's
@@ -265,4 +268,65 @@ func FuzzBuildV1_NeverPanics(f *testing.F) {
 		}()
 		BuildV1(entries, 0, 99, fakeFooterLookup(footers), fetchURL)
 	})
+}
+
+// TestBuildV2_RangesAreSortedAndMerged pins the fix for a real dataset
+// failure: a file with many terms against one shared xorb produced V1
+// fetch_info entries in file order, so the grouped V2 range list was
+// unsorted and contained duplicates/overlaps. xet-core then rejected the
+// file with "chunk_start N not found in chunk_ranges ... for file term M".
+func TestBuildV2_RangesAreSortedAndMerged(t *testing.T) {
+	xorbHash := hashFromByte(0x12)
+	// 200 chunks, 10 bytes each.
+	offsets := make([]uint32, 200)
+	for i := range offsets {
+		offsets[i] = uint32((i + 1) * 10)
+	}
+	footers := map[merklehash.Hash]xorbformat.FooterV1{
+		xorbHash: {ChunkBoundaryOffsets: offsets},
+	}
+	entries := []shardformat.FileDataSequenceEntry{
+		{XorbHash: xorbHash, UnpackedSegmentBytes: 1140, ChunkIndexStart: 0, ChunkIndexEnd: 114},
+		{XorbHash: xorbHash, UnpackedSegmentBytes: 10, ChunkIndexStart: 100, ChunkIndexEnd: 101},
+		{XorbHash: xorbHash, UnpackedSegmentBytes: 10, ChunkIndexStart: 114, ChunkIndexEnd: 115},
+		{XorbHash: xorbHash, UnpackedSegmentBytes: 10, ChunkIndexStart: 116, ChunkIndexEnd: 117},
+		{XorbHash: xorbHash, UnpackedSegmentBytes: 10, ChunkIndexStart: 114, ChunkIndexEnd: 115},
+		{XorbHash: xorbHash, UnpackedSegmentBytes: 10, ChunkIndexStart: 118, ChunkIndexEnd: 119},
+		{XorbHash: xorbHash, UnpackedSegmentBytes: 10, ChunkIndexStart: 119, ChunkIndexEnd: 120},
+	}
+	fetchURL, _ := fakeFetchURLBuilder()
+
+	resp, err := BuildV2(entries, 0, int64(1<<20), fakeFooterLookup(footers), fetchURL)
+	if err != nil {
+		t.Fatalf("BuildV2() error = %v", err)
+	}
+	fetches := resp.Xorbs[xorbHash.Hex()]
+	if len(fetches) != 1 {
+		t.Fatalf("got %d fetches, want 1", len(fetches))
+	}
+	want := []XorbRangeDescriptor{
+		{Chunks: IndexRange{Start: 0, End: 115}, Bytes: ByteRange{Start: 0, End: 1149}},
+		{Chunks: IndexRange{Start: 116, End: 117}, Bytes: ByteRange{Start: 1160, End: 1169}},
+		{Chunks: IndexRange{Start: 118, End: 120}, Bytes: ByteRange{Start: 1180, End: 1199}},
+	}
+	if len(fetches[0].Ranges) != len(want) {
+		t.Fatalf("got ranges %+v, want %+v", fetches[0].Ranges, want)
+	}
+	for i := range want {
+		if fetches[0].Ranges[i] != want[i] {
+			t.Errorf("range[%d] = %+v, want %+v", i, fetches[0].Ranges[i], want[i])
+		}
+	}
+	for i, term := range resp.Terms {
+		found := false
+		for _, r := range fetches[0].Ranges {
+			if term.Range.Start >= r.Chunks.Start && term.Range.Start < r.Chunks.End {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("term[%d] chunk_start %d is not covered by any merged range", i, term.Range.Start)
+		}
+	}
 }

@@ -8,13 +8,38 @@ import (
 
 const frameMagic = 0x184D2204
 
+// maxFrameOutput bounds DecompressFrame's total output when the caller has
+// no more specific expected size. A chunk's declared UncompressedLength is
+// 24-bit (at most ~16 MiB), so 64 MiB is generous for the only production
+// caller while still preventing a frame made of many small, individually
+// legal blocks from amplifying without bound.
+const maxFrameOutput = 64 << 20
+
 // DecompressFrame decompresses a complete LZ4 frame (magic number, frame
 // descriptor, one or more blocks, end mark, optional checksums) per the
 // public frame format spec. Checksums (header/block/content) are present
 // on the wire but not verified here - this server only needs the decoded
 // bytes to re-hash and compare against a client-claimed chunk hash, and a
 // checksum mismatch would just mean the re-hash comparison fails anyway.
+//
+// Output is capped at maxFrameOutput. Callers that know the expected
+// decoded size (the chunk decoder does: the chunk header's
+// UncompressedLength) should use DecompressFrameLimit instead, which
+// rejects the frame before it can allocate past that exact size.
 func DecompressFrame(src []byte) ([]byte, error) {
+	return DecompressFrameLimit(src, maxFrameOutput)
+}
+
+// DecompressFrameLimit is DecompressFrame with an explicit total-output
+// ceiling. A frame whose blocks collectively decode past maxOutput is
+// rejected with an error rather than allocating the extra bytes. This is
+// the per-frame counterpart to decompressBlockUnknownSize's per-block
+// ceiling: without it, a compressed frame containing many individually
+// valid blocks could still amplify far beyond its input size.
+func DecompressFrameLimit(src []byte, maxOutput int) ([]byte, error) {
+	if maxOutput < 0 {
+		return nil, fmt.Errorf("lz4: negative frame output limit %d", maxOutput)
+	}
 	if len(src) < 7 {
 		return nil, fmt.Errorf("lz4: frame too short")
 	}
@@ -76,6 +101,9 @@ func DecompressFrame(src []byte) ([]byte, error) {
 		}
 
 		if uncompressedFlag {
+			if len(blockData) > maxOutput-len(out) {
+				return nil, fmt.Errorf("lz4: frame output exceeds limit %d bytes", maxOutput)
+			}
 			out = append(out, blockData...)
 			continue
 		}
@@ -84,6 +112,9 @@ func DecompressFrame(src []byte) ([]byte, error) {
 		decoded, err := decompressBlockUnknownSize(blockData, maxBlockSize)
 		if err != nil {
 			return nil, fmt.Errorf("lz4: decompress block: %w", err)
+		}
+		if len(decoded) > maxOutput-len(out) {
+			return nil, fmt.Errorf("lz4: frame output exceeds limit %d bytes", maxOutput)
 		}
 		out = append(out, decoded...)
 	}

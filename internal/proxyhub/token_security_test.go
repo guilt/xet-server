@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -199,5 +200,58 @@ func TestXetToken_NotWrittenToSnapshot(t *testing.T) {
 		if bytes.Contains(data, []byte(secret)) {
 			t.Errorf("snapshot contains %q; tokens and caller credentials must stay in memory", secret)
 		}
+	}
+}
+
+// TestXetTokenCache_401NotMaskedByCachedToken pins the auth-failure half of
+// the cache policy: a token cached for this same credential must not be
+// served once upstream starts rejecting that credential with 401/403.
+func TestXetTokenCache_401NotMaskedByCachedToken(t *testing.T) {
+	var reject atomic.Bool
+	hubTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if reject.Load() {
+			http.Error(w, "credential revoked", http.StatusUnauthorized)
+			return
+		}
+		json.NewEncoder(w).Encode(hfclient.XetToken{
+			CasURL:      "https://real-cas.example.invalid",
+			AccessToken: aliceTokenValue,
+			Exp:         time.Now().Add(time.Hour).Unix(),
+		})
+	}))
+	defer hubTS.Close()
+
+	s := newTestServer(hubTS, "http://localhost:8420")
+	s.CacheTTL = time.Hour
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	get := func() *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/models/alice/private/xet-read-token/main", nil)
+		req.Header.Set("Authorization", aliceCredential)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET error = %v", err)
+		}
+		return resp
+	}
+
+	prime := get()
+	if prime.StatusCode != http.StatusOK {
+		t.Fatalf("prime status = %d, want 200", prime.StatusCode)
+	}
+	prime.Body.Close()
+
+	reject.Store(true)
+	s.CacheTTL = -1 // force a live refresh instead of the still-fresh cache entry
+	resp := get()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (must not serve the stale cached token)", resp.StatusCode)
+	}
+	if bytes.Contains(body, []byte(aliceTokenValue)) {
+		t.Error("401 response leaked the stale cached token")
 	}
 }

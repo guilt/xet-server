@@ -120,7 +120,7 @@ func DecompressChunkPayload(scheme CompressionScheme, payload []byte, uncompress
 		}
 		return payload, nil
 	case CompressionLZ4:
-		decoded, err := lz4.DecompressFrame(payload)
+		decoded, err := lz4.DecompressFrameLimit(payload, int(uncompressedLen))
 		if err != nil {
 			return nil, err
 		}
@@ -129,7 +129,7 @@ func DecompressChunkPayload(scheme CompressionScheme, payload []byte, uncompress
 		}
 		return decoded, nil
 	case CompressionByteGrouping4LZ4:
-		decoded, err := lz4.DecompressFrame(payload)
+		decoded, err := lz4.DecompressFrameLimit(payload, int(uncompressedLen))
 		if err != nil {
 			return nil, err
 		}

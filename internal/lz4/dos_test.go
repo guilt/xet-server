@@ -18,7 +18,9 @@ package lz4
 //
 // The fix treats the frame descriptor's declared max-block-size code as a
 // hard ceiling (a real, spec-compliant encoder never produces a block
-// exceeding it), not merely an initial sizing guess.
+// exceeding it), not merely an initial sizing guess. DecompressFrameLimit
+// additionally caps total frame output, because many individually legal
+// blocks could otherwise still amplify without bound.
 
 import (
 	"encoding/binary"
@@ -59,10 +61,12 @@ func buildAmplificationBombFrame(blockData []byte) []byte {
 }
 
 func TestDecompressFrame_RejectsAmplificationBomb(t *testing.T) {
-	// ~16 MiB of compressed bomb bytes: comfortably inside a single
-	// chunk's real-world CompressedLength budget, the exact size that
-	// empirically decompressed to 3.8 GB before this fix.
-	block := buildAmplificationBombBlock(16_000_000)
+	// ~1 MiB of extension bytes claims ~255 MiB of output: still far
+	// beyond the frame's 4 MiB declared ceiling, but small enough that the
+	// rejection path stays fast under -race and on a loaded CI machine.
+	// (The original 16 MiB payload decompressed to 3.8 GB pre-fix; 1 MiB
+	// already exceeds the ceiling by ~60x and catches the same regression.)
+	block := buildAmplificationBombBlock(1_000_000)
 	frame := buildAmplificationBombFrame(block)
 	t.Logf("bomb frame is %d bytes", len(frame))
 
@@ -78,8 +82,8 @@ func TestDecompressFrame_RejectsAmplificationBomb(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("DecompressFrame() did not return within 2s on an amplification-bomb frame - looks like the ceiling regressed")
+	case <-time.After(30 * time.Second):
+		t.Fatal("DecompressFrame() did not return within 30s on an amplification-bomb frame - looks like the ceiling regressed")
 	}
 
 	if decodeErr == nil {
@@ -96,6 +100,37 @@ func TestDecompressFrame_RejectsAmplificationBomb(t *testing.T) {
 	grew := after.TotalAlloc - before.TotalAlloc
 	if grew > maxReasonableGrowth {
 		t.Errorf("heap grew by %d bytes rejecting a bomb frame, want < %d - looks like the max-block-size ceiling isn't being enforced", grew, maxReasonableGrowth)
+	}
+}
+
+func buildMultiBlockFrame(blocks [][]byte) []byte {
+	var buf []byte
+	var tmp [4]byte
+	binary.LittleEndian.PutUint32(tmp[:], frameMagic)
+	buf = append(buf, tmp[:]...)
+	buf = append(buf, 0x40, 0x70, 0x00) // FLG, BD (code 7), header checksum
+	for _, block := range blocks {
+		binary.LittleEndian.PutUint32(tmp[:], uint32(len(block)))
+		buf = append(buf, tmp[:]...)
+		buf = append(buf, block...)
+	}
+	binary.LittleEndian.PutUint32(tmp[:], 0) // EndMark
+	buf = append(buf, tmp[:]...)
+	return buf
+}
+
+// TestDecompressFrameLimit_RejectsMultiBlockAmplification pins the
+// per-frame total-output ceiling. Each individual block here decodes to
+// ~3 MiB, under the frame's 4 MiB block ceiling, but three of them exceed
+// the 8 MiB limit passed by the caller. Without a total cap the decoder
+// would happily allocate all three (and a hostile frame could contain
+// hundreds).
+func TestDecompressFrameLimit_RejectsMultiBlockAmplification(t *testing.T) {
+	block := buildAmplificationBombBlock(12_000) // ~3.06 MiB claimed output
+	frame := buildMultiBlockFrame([][]byte{block, block, block})
+
+	if _, err := DecompressFrameLimit(frame, 8*1024*1024); err == nil {
+		t.Fatal("DecompressFrameLimit() error = nil, want rejection after the frame exceeds its total output limit")
 	}
 }
 

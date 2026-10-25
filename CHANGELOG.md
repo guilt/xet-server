@@ -5,6 +5,33 @@ All notable changes to Xet Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-10-25
+
+Reconstruction-correctness and regression-coverage release.
+
+### Fixed
+
+- **V2 reconstruction range lists are sorted and merged.** A file with
+  many terms against one shared xorb could produce an unsorted range list
+  with duplicate/overlapping entries, causing xet-core to reject a valid
+  file with `chunk_start N not found in chunk_ranges ... for file term M`.
+  `reconwire.BuildV2` now sorts by chunk start and merges overlapping or
+  adjacent ranges; V1 behavior is unchanged.
+
+- **LZ4 frame output is capped per frame, not just per block.** The block
+  max-size ceiling stops one amplified block, but a frame can contain many
+  individually legal blocks. `DecompressFrameLimit` now enforces a total
+  output limit, and `xorbformat.DecompressChunkPayload` passes the chunk
+  header's declared `UncompressedLength`, so a multi-block amplification
+  frame is rejected before allocating beyond the chunk's allowed size.
+  `DecompressFrame` keeps a conservative 64 MiB default for other callers.
+
+### Added
+
+- Regression tests for V2 range sorting/merging, token-cache 401/403
+  handling after a cached value exists, oversized presigned-slice
+  fallback, and fetch-group sorting/gap behavior.
+
 ## [1.3.0] - 2026-10-24
 
 Security-hardening release. Authorization-dependent proxy caches are now

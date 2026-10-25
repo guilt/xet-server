@@ -20,6 +20,7 @@ package reconwire
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/guilt/xet-server/internal/merklehash"
 	"github.com/guilt/xet-server/internal/shardformat"
@@ -293,5 +294,60 @@ func BuildV2(entries []shardformat.FileDataSequenceEntry, rangeStart, rangeEnd i
 	if err != nil {
 		return ResponseV2{}, err
 	}
+	normalizeV2Ranges(&resp)
 	return resp, nil
+}
+
+// normalizeV2Ranges sorts each xorb's range list and merges overlapping or
+// adjacent ranges. xet-core's reconstruction reader binary-searches /
+// validates a term's chunk_start against this list; V1 emits one entry per
+// term in file order, so a file with many terms against one shared xorb
+// produces an unsorted list with duplicate and overlapping ranges. That is
+// valid V1 data, but V2's single grouped list must be ordered and
+// non-overlapping or the client can reject a perfectly good file with
+// "chunk_start N not found in chunk_ranges ... for file term M".
+func normalizeV2Ranges(resp *ResponseV2) {
+	for hash, fetches := range resp.Xorbs {
+		for i := range fetches {
+			fetches[i].Ranges = mergeXorbRanges(fetches[i].Ranges)
+		}
+		resp.Xorbs[hash] = fetches
+	}
+}
+
+func mergeXorbRanges(ranges []XorbRangeDescriptor) []XorbRangeDescriptor {
+	if len(ranges) < 2 {
+		return ranges
+	}
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].Chunks.Start != ranges[j].Chunks.Start {
+			return ranges[i].Chunks.Start < ranges[j].Chunks.Start
+		}
+		if ranges[i].Chunks.End != ranges[j].Chunks.End {
+			return ranges[i].Chunks.End < ranges[j].Chunks.End
+		}
+		return ranges[i].Bytes.Start < ranges[j].Bytes.Start
+	})
+	merged := make([]XorbRangeDescriptor, 0, len(ranges))
+	for _, r := range ranges {
+		if len(merged) == 0 {
+			merged = append(merged, r)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		if r.Chunks.Start <= last.Chunks.End && r.Bytes.Start <= last.Bytes.End+1 {
+			if r.Chunks.End > last.Chunks.End {
+				last.Chunks.End = r.Chunks.End
+			}
+			if r.Bytes.Start < last.Bytes.Start {
+				last.Bytes.Start = r.Bytes.Start
+			}
+			if r.Bytes.End > last.Bytes.End {
+				last.Bytes.End = r.Bytes.End
+			}
+			continue
+		}
+		merged = append(merged, r)
+	}
+	return merged
 }

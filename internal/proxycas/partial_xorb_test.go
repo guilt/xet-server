@@ -15,6 +15,7 @@ package proxycas
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -397,5 +398,81 @@ func TestReconstruction_SupersetFetchInfoGroupIsSharedByTerms(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("offline status = %d, want 200", resp2.StatusCode)
+	}
+}
+
+func TestContiguousFetchGroups_SortsMergesAndKeepsGaps(t *testing.T) {
+	infos := []reconwire.FetchInfoEntry{
+		{Range: reconwire.IndexRange{Start: 10, End: 15}},
+		{Range: reconwire.IndexRange{Start: 0, End: 5}},
+		{Range: reconwire.IndexRange{Start: 5, End: 10}},
+		{Range: reconwire.IndexRange{Start: 20, End: 25}},
+		{Range: reconwire.IndexRange{Start: 22, End: 30}},
+	}
+	groups := contiguousFetchGroups(infos)
+	if len(groups) != 2 {
+		t.Fatalf("groups = %d, want 2 (0-15 and 20-30)", len(groups))
+	}
+	if start, end := groupChunkRange(groups[0]); start != 0 || end != 15 {
+		t.Errorf("group[0] range = [%d,%d), want [0,15)", start, end)
+	}
+	if start, end := groupChunkRange(groups[1]); start != 20 || end != 30 {
+		t.Errorf("group[1] range = [%d,%d), want [20,30)", start, end)
+	}
+}
+
+func TestValidateFetchGroup_RejectsEmptyRange(t *testing.T) {
+	err := validateFetchGroup([]reconwire.FetchInfoEntry{{Range: reconwire.IndexRange{Start: 7, End: 7}}})
+	if !errors.Is(err, errPartialXorbCoverage) {
+		t.Fatalf("validateFetchGroup() error = %v, want errPartialXorbCoverage", err)
+	}
+	if err := validateFetchGroup([]reconwire.FetchInfoEntry{{Range: reconwire.IndexRange{Start: 7, End: 8}}}); err != nil {
+		t.Fatalf("validateFetchGroup() valid error = %v, want nil", err)
+	}
+}
+
+func TestReconstruction_OversizedPresignedSliceRelaysLive(t *testing.T) {
+	payloads := [][]byte{[]byte("first chunk"), []byte("second chunk")}
+	blob, xorbHash := buildFooterlessXorb(t, payloads)
+	entries, err := xorbformat.ScanChunks(bytes.NewReader(blob))
+	if err != nil {
+		t.Fatalf("ScanChunks() error = %v", err)
+	}
+	fileHash := hashFromByte(0xE9)
+
+	// Deliberately ignore Range and return the whole object with 200. The
+	// bytes are longer than the url_range, so cachePartialGroup must reject
+	// them rather than indexing chunks at the wrong offsets.
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(blob)
+	}))
+	defer cdn.Close()
+
+	upstream := newRecoUpstream(fileHash.Hex())
+	upstream.resp = &reconwire.ResponseV1{
+		Terms: []reconwire.Term{
+			{Hash: xorbHash.Hex(), Range: reconwire.IndexRange{Start: 1, End: 2}, UnpackedLength: uint32(len(payloads[1]))},
+		},
+		FetchInfo: map[string][]reconwire.FetchInfoEntry{
+			xorbHash.Hex(): {
+				{URL: cdn.URL + "/blob", URLRange: chunkURLRange(entries, 1, 2), Range: reconwire.IndexRange{Start: 1, End: 2}},
+			},
+		},
+	}
+	casTS := httptest.NewServer(upstream.handler())
+	defer casTS.Close()
+
+	ts, proxy := newTestServer(t, casTS)
+	resp, err := http.Get(ts.URL + "/v1/reconstructions/" + fileHash.Hex())
+	if err != nil {
+		t.Fatalf("GET error = %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (must relay, not fail)", resp.StatusCode)
+	}
+	if proxy.Embedded.HasFileRecon(fileHash) {
+		t.Fatal("oversized presigned slice was cached")
 	}
 }

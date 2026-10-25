@@ -379,9 +379,19 @@ any block that grows past it as malformed/hostile. This can only ever
 reject a frame that violates the spec's own guarantee - no legitimate
 frame is affected. See `internal/lz4/dos_test.go`'s
 `TestDecompressFrame_RejectsAmplificationBomb` (reproduces the exact
-payload shape, asserts rejection within 2 seconds and bounded heap growth)
-and `TestDecompressFrame_LargeBlockUnderCeilingStillWorks` (confirms a
-legitimately large block under the ceiling still decodes correctly).
+payload shape and asserts rejection with bounded heap growth),
+`TestDecompressFrame_LargeBlockUnderCeilingStillWorks` (confirms a
+legitimately large block under the ceiling still decodes correctly), and
+`TestDecompressFrameLimit_RejectsMultiBlockAmplification` (below).
+
+A per-block ceiling alone is not enough: a frame can contain many
+individually legal blocks, each just under the declared maximum, so
+`DecompressFrameLimit` also enforces a **total frame output** limit.
+`xorbformat.DecompressChunkPayload` passes the chunk header's declared
+`UncompressedLength` as that limit, rejecting the frame before it can
+allocate more than the chunk is allowed to contain. `DecompressFrame`
+itself uses a conservative 64 MiB default for callers without a more
+specific expected size.
 
 The general lesson, distinct from but complementary to #7's: a format
 that lets the *sender* declare a bound on decoded size (here, the frame
@@ -504,12 +514,15 @@ them.
 `xorbFooterAndPhysicalRange` with `handleReconstructionV1` (see
 reconstruction.go) - both compute the exact same per-term physical byte
 ranges; V2 only changes how those ranges get packaged into the response,
-grouping consecutive ranges for the same xorb hash into one
-`XorbMultiRangeFetch` entry rather than emitting a new `fetch_info` entry
-per term. `TestReconstructionV2_MatchesV1Data` cross-checks this
-directly: it decodes both a V1 and a V2 response for the identical file
-and asserts every term and byte range matches exactly, differing only in
-how they're grouped.
+grouping ranges for the same xorb hash into one `XorbMultiRangeFetch`
+entry rather than emitting a new `fetch_info` entry per term. The grouped
+range list is sorted by chunk start and overlapping/adjacent ranges are
+merged, because xet-core validates each file term's `chunk_start` against
+this list; emitting V1's file-order list verbatim can make the client
+reject a valid file with `chunk_start N not found in chunk_ranges ... for
+file term M`. `TestReconstructionV2_MatchesV1Data` cross-checks that the
+terms and physical byte ranges still match V1, and
+`TestBuildV2_RangesAreSortedAndMerged` pins the ordering/merge rule.
 
 ## 11. Persistence: an atomic snapshot checkpoint, deliberately not a WAL
 
