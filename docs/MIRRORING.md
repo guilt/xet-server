@@ -41,8 +41,12 @@ know what a repo is.
 `./xet-data` is a plain directory - everything (chunks, xorbs, shard
 metadata, and the Hub shim's repo/commit index) lives under it, and
 survives a restart via periodic snapshotting (see
-[Storage backends](../README.md#storage-backends) in the main README). For
-a real, long-running mirror, point `-data` at a disk with enough room for
+[Storage backends](../README.md#storage-backends) in the main README). A
+large handoff index can be several GB; for read-only offline serving pass
+`-snapshot-interval 0`, otherwise the server rewrites that whole snapshot
+every minute.
+
+For a real, long-running mirror, point `-data` at a disk with enough room for
 every model you plan to host, plus growth - see
 [storage auto-pruning](../README.md#storage-auto-pruning-upload-rate-limiting-dedup-verification-and-persistence)
 if you want to cap it instead.
@@ -212,7 +216,17 @@ section for the full flag reference (rate limiting, cache TTL, the
 subsection for the "huggingface.co is really gone now" story: stop the
 proxy, point a plain `xetd` at the exact same `-data` directory, and
 what the proxy did cache keeps working, byte-identical, with no proxy
-process required.
+process required. Start that handed-off `xetd` with
+`-snapshot-interval 0` for read-only serving: it loads the snapshot once
+(which can take tens of seconds for a multi-GB index) and avoids periodic
+full rewrites. Only files actually fetched through the proxy are cached;
+other sibling files in the same repo are still 404 offline.
+
+Authorization-dependent caches are per-caller: the upstream xet-token
+cache is keyed by the caller's credential, repo-info/tree/resolve
+freshness is credential-scoped, an upstream 401/403 is never hidden by a
+stale entry, and tokens are kept in memory only - never in the `-data`
+snapshots.
 
 ### 9.1 Partial xorb slices are cached as synthetic xorbs
 
@@ -241,9 +255,11 @@ succeeds from the CDN, but that file is not cached; the proxy logs it at
 DEBUG proxycas: file not cacheable, fetch_info does not cover every term
 ```
 
-Non-Xet blobs (a repo's `README.md`, `.gitattributes`, small CSVs) are
-relayed live and are not part of the CAS cache at all. Section 10 is the
-way to guarantee those too.
+Only the files actually fetched through the proxy are cached. Other
+sibling files listed in the same repo's tree are not downloaded and remain
+unavailable offline. Non-Xet blobs (a repo's `README.md`, `.gitattributes`,
+small CSVs) are relayed live and are not part of the CAS cache at all.
+Section 10 is the way to guarantee both cases.
 ## 10. Building a guaranteed-complete offline library (two-phase)
 
 If your goal is "I want to unplug the network, run a plain `xetd`, and

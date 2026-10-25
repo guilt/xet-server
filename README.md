@@ -405,11 +405,20 @@ has already passed: a transient upstream `xet-{read,write}-token` failure
 can never hand the client a token that is dead on arrival, it surfaces the
 upstream error instead (a clean, retryable failure).
 
+**Authorization-dependent caches are per-caller.** The upstream xet-token
+cache is keyed by a fingerprint of the caller's `Authorization` header
+(alongside repo/ref/kind), and repo-info/tree/resolve freshness is
+credential-scoped too. One caller's token or private-repo metadata can
+never be served to another caller, and an upstream `401`/`403` is returned
+instead of being masked by a stale cached value. The token cache and
+401-heal index are process-memory only - they are never written into the
+`-data` snapshots.
+
 **Any upstream failure - network error, timeout, 5xx - falls back to
 whatever is already cached, no matter how old**, rather than erroring;
 this fallback is the whole reason the proxy exists. `-cache-ttl` (default
 `-1`, meaning "always try upstream first") controls how long cached Hub
-metadata (repo-info, tree, xet-token, resolve) is served without even
+metadata (repo-info, tree, resolve) and same-credential xet tokens are served without even
 attempting a live refresh; it never affects the CAS byte cache, which is
 content-addressed and can't go stale by definition. `-metadata-call-timeout`
 (default `30s`) bounds each individual metadata call so a slow-but-not-dead
@@ -442,11 +451,14 @@ huggingface.co just as much as a write does, so both need the same
 protection. One shared limiter covers both ports, so a client can't double
 its effective budget by splitting requests across them.
 
-`-snapshot-interval` (default `1m`) persists both the CAS-facing and
-Hub-facing caches to `-data` - using the **exact same filenames** `xetd`
-itself reads and writes (`casserver-snapshot.json`/
-`hubserver-snapshot.json`), which is what makes the handoff below work at
-all.
+`-snapshot-interval` (default `1m`) persists the CAS xorb/file index and
+the Hub repo/revision/file/resolve metadata to `-data` - using the
+**exact same filenames** `xetd` itself reads and writes
+(`casserver-snapshot.json`/`hubserver-snapshot.json`), which is what makes
+the handoff below work at all. Upstream credentials and xet access tokens
+are deliberately **not** persisted. For a read-only offline handoff with a
+large index, start the handed-off `xetd` with `-snapshot-interval 0` so it
+does not rewrite a multi-GB snapshot every minute.
 
 ## Offline handoff, proving the point
 
@@ -461,7 +473,7 @@ kill %1
 # 3. huggingface.co is gone / unreachable / you're fully offline now.
 #    Point a PLAIN xetd at the SAME data directory - no -upstream-hub-url,
 #    no network, nothing but what step 1 already cached:
-./bin/xetd -addr :8420 -hub-addr :8421 -data ./xet-proxy-data
+./bin/xetd -addr :8420 -hub-addr :8421 -data ./xet-proxy-data -snapshot-interval 0
 
 # 4. The exact same download still works, byte-identical, forever:
 HF_ENDPOINT=http://localhost:8421 hf download someuser/some-model --local-dir ./downloaded-again
