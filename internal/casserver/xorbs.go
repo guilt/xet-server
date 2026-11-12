@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/guilt/xet-server/internal/merklehash"
@@ -257,24 +258,66 @@ func (s *Server) handleHeadXorb(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// parseByteRange parses a "bytes=start-end" Range header (single range
-// only, inclusive end per HTTP semantics). Returns hasRange=false if
-// header is empty.
+// parseByteRange parses a single-range HTTP Range header with the three
+// forms real clients actually send: "bytes=start-end", the open-ended
+// "bytes=start-" (hf_xet uses this for reconstruction responses), and the
+// suffix form "bytes=-length". Multi-range requests are intentionally not
+// supported (this server serves one contiguous range per response).
+// Inclusive end, per HTTP semantics. Returns hasRange=false if header is
+// empty.
 func parseByteRange(header string, total int64) (start, end int64, hasRange bool, err error) {
 	if header == "" {
 		return 0, 0, false, nil
 	}
 	const prefix = "bytes="
-	if len(header) < len(prefix) || header[:len(prefix)] != prefix {
+	if !strings.HasPrefix(header, prefix) {
 		return 0, 0, false, fmt.Errorf("malformed Range header")
 	}
-	spec := header[len(prefix):]
-	var s, e int64
-	n, err := fmt.Sscanf(spec, "%d-%d", &s, &e)
-	if err != nil || n != 2 {
+	spec := strings.TrimSpace(header[len(prefix):])
+	if spec == "" || strings.Contains(spec, ",") {
 		return 0, 0, false, fmt.Errorf("malformed Range header")
 	}
-	if s < 0 || e < s || s >= total {
+	dash := strings.IndexByte(spec, '-')
+	if dash < 0 {
+		return 0, 0, false, fmt.Errorf("malformed Range header")
+	}
+	startStr := strings.TrimSpace(spec[:dash])
+	endStr := strings.TrimSpace(spec[dash+1:])
+
+	// Suffix form: "bytes=-N" means the last N bytes.
+	if startStr == "" {
+		if endStr == "" || strings.Contains(endStr, "-") {
+			return 0, 0, false, fmt.Errorf("malformed Range header")
+		}
+		n, parseErr := strconv.ParseInt(endStr, 10, 64)
+		if parseErr != nil || n < 0 {
+			return 0, 0, false, fmt.Errorf("malformed Range header")
+		}
+		if n == 0 || total <= 0 {
+			return 0, 0, false, fmt.Errorf("range not satisfiable")
+		}
+		if n >= total {
+			return 0, total - 1, true, nil
+		}
+		return total - n, total - 1, true, nil
+	}
+
+	s, parseErr := strconv.ParseInt(startStr, 10, 64)
+	if parseErr != nil || s < 0 {
+		return 0, 0, false, fmt.Errorf("malformed Range header")
+	}
+	if total <= 0 || s >= total {
+		return 0, 0, false, fmt.Errorf("range not satisfiable")
+	}
+	// Open-ended form: "bytes=start-" means through EOF.
+	if endStr == "" {
+		return s, total - 1, true, nil
+	}
+	e, parseErr := strconv.ParseInt(endStr, 10, 64)
+	if parseErr != nil || strings.Contains(endStr, "-") {
+		return 0, 0, false, fmt.Errorf("malformed Range header")
+	}
+	if e < s {
 		return 0, 0, false, fmt.Errorf("range not satisfiable")
 	}
 	if e >= total {

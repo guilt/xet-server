@@ -46,6 +46,15 @@ large handoff index can be several GB; for read-only offline serving pass
 `-snapshot-interval 0`, otherwise the server rewrites that whole snapshot
 every minute.
 
+A snapshot is only an index; the stored blobs are the source of truth. On
+startup both `xetd` and `xet-proxyd` reconcile the snapshot's recorded xorb
+lengths against the blobs actually present. A stale length is corrected and
+that xorb's footer is re-derived from the real bytes; if a blob is gone, its
+metadata and any file reconstruction referencing it are dropped so a proxy
+refetches instead of advertising an unservable file. This is what prevents a
+resumed mirror from silently truncating a Range response or returning a
+valid range as `416`.
+
 For a real, long-running mirror, point `-data` at a disk with enough room for
 every model you plan to host, plus growth - see
 [storage auto-pruning](../README.md#storage-auto-pruning-upload-rate-limiting-dedup-verification-and-persistence)

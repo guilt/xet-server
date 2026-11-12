@@ -71,6 +71,44 @@ func TestIngestFile_WithZeroXetHashStillRecordsFile(t *testing.T) {
 	}
 }
 
+func TestIngestFile_ZeroHashDoesNotClobberRicherMetadata(t *testing.T) {
+	s := newIngestTestServer(t)
+	xetHash := hashFromByte(0xCD)
+	s.IngestFile("model", "alice/my-model", "main", "model.bin", "deadbeef", 1024, xetHash)
+
+	// A concurrent repo-info/tree response only knows the sibling path, not
+	// its Xet hash or size. It must enrich, never erase, the resolve data.
+	s.IngestFile("model", "alice/my-model", "main", "model.bin", "", 0, merklehash.Hash{})
+
+	vs := s.getOrCreateRepo("model", "alice/my-model").getOrCreateRevision("main")
+	vs.mu.RLock()
+	ref := vs.files["model.bin"]
+	vs.mu.RUnlock()
+	if ref == nil {
+		t.Fatal("file entry vanished after a zero-metadata ingest")
+	}
+	if ref.XetHash != xetHash {
+		t.Errorf("XetHash = %v, want the richer existing %v", ref.XetHash, xetHash)
+	}
+	if ref.Size != 1024 {
+		t.Errorf("Size = %d, want the richer existing 1024", ref.Size)
+	}
+	if ref.SHA256Hex != "deadbeef" {
+		t.Errorf("SHA256Hex = %q, want the richer existing %q", ref.SHA256Hex, "deadbeef")
+	}
+
+	// The reverse order must still let a later resolve enrich a bare entry.
+	s.IngestFile("model", "alice/my-model", "main", "later.bin", "", 0, merklehash.Hash{})
+	laterHash := hashFromByte(0xEF)
+	s.IngestFile("model", "alice/my-model", "main", "later.bin", "cafebabe", 2048, laterHash)
+	vs.mu.RLock()
+	later := vs.files["later.bin"]
+	vs.mu.RUnlock()
+	if later == nil || later.XetHash != laterHash || later.Size != 2048 || later.SHA256Hex != "cafebabe" {
+		t.Errorf("later resolve did not enrich bare entry: %+v", later)
+	}
+}
+
 func TestHasRepo_UnknownRepoReturnsFalse(t *testing.T) {
 	s := newIngestTestServer(t)
 	if s.HasRepo("model", "nobody/nothing") {

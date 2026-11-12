@@ -5,6 +5,48 @@ All notable changes to Xet Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-11-11
+
+Mirroring-correctness release for long-running `hf` downloads and
+snapshot-restored caches.
+
+### Fixed
+
+- **Open-ended and suffix HTTP Range requests are supported.**
+  `xetd`/`xet-proxyd` previously parsed only `bytes=start-end`.
+  `hf_xet` sends the open-ended `bytes=0-` form for reconstruction
+  fetches, which was rejected with `416 Range Not Satisfiable` and
+  surfaced to the client as a reconstruction decode/EOF error.
+  `parseByteRange` now accepts closed (`bytes=a-b`), open-ended
+  (`bytes=a-`), and suffix (`bytes=-n`) single ranges; multi-range
+  requests remain unsupported and return `416`.
+
+- **Snapshot-restored xorb lengths are reconciled with storage at
+  startup.** A snapshot is only an index; the content-addressed blob is
+  the source of truth. A stale or partially migrated `xorbRawLength`
+  could disagree with the stored blob, causing a ranged xorb response to
+  be truncated (`unexpected end of file`) or a valid range to be rejected
+  as unsatisfiable. `casserver.ReconcileXorbLengths` now corrects stale
+  lengths, invalidates those xorbs' footers so they are re-derived from
+  the real bytes, and drops metadata (plus any file reconstructions that
+  referenced it) for blobs that are gone. Both `xetd` and `xet-proxyd`
+  run it after loading a snapshot.
+
+- **Repo-info/tree ingestion no longer erases richer resolve metadata.**
+  A concurrent repo-info response, which only knows a sibling's path,
+  could overwrite a file entry already learned from a resolve/tree
+  response with a zero Xet hash and size. A later fast-path resolve then
+  returned `404` until another live resolve repaired the entry.
+  `hubserver.IngestFile` now merges missing fields instead of replacing
+  them, so a bare entry can never clobber known Xet metadata.
+
+### Added
+
+- Regression coverage for open-ended and suffix ranges, startup
+  reconciliation of stale xorb lengths, removal of missing blobs and
+  dependent file reconstructions, and non-clobbering `IngestFile`
+  merges.
+
 ## [1.4.0] - 2026-10-25
 
 Reconstruction-correctness and regression-coverage release.

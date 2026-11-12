@@ -111,6 +111,10 @@ func main() {
 	if err := casSrv.Embedded.LoadSnapshot(casSnapshotPath); err != nil {
 		log.Fatalf("load CAS snapshot: %v", err)
 	}
+	// A snapshot is only an index; reconcile its recorded xorb lengths (and
+	// invalidate footers/entries) against the blobs actually on disk before
+	// serving, so a stale length can never truncate a Range response.
+	casSrv.Embedded.ReconcileXorbLengths(context.Background())
 
 	resolvedCASURL := *casURL
 	if resolvedCASURL == "" {

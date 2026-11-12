@@ -540,11 +540,12 @@ identically on an air-gapped machine.
 - `POST /v1/xorbs/{prefix}/{hash}` - upload a serialized xorb (chunk
   headers + payloads, no footer - see PROTOCOL.md)
 - `GET /v1/xorbs/{prefix}/{hash}` - fetch raw (possibly compressed) xorb
-  bytes, honors `Range`
+  bytes, honors closed, open-ended, and suffix single `Range` forms
 - `POST /v1/shards` - upload a serialized shard (file/xorb info sections,
   no footer)
 - `GET /v1/reconstructions/{file_id}` - file -> xorb/chunk-range map,
-  honors `Range`, returns `416` at EOF
+  honors closed, open-ended, and suffix single `Range` forms, returns `416`
+  at EOF
 - `GET /v1/chunks/{prefix}/{hash}` - global chunk-dedup lookup: returns
   the raw bytes of whichever uploaded shard referenced this chunk hash
   (the real wire contract - a client parses the shard itself), `404` if

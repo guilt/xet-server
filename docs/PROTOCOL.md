@@ -219,6 +219,11 @@ the requested window, computes `offset_into_first_range` correctly for a
 window that starts mid-term, and returns `416` when `rangeStart >= fileSize`
 - exactly the signal real `hf_xet` is waiting for to stop paging.
 
+`parseByteRange` supports the three single-range forms real clients send:
+closed (`bytes=a-b`), open-ended (`bytes=a-`, which `hf_xet` uses for a
+whole-file reconstruction request), and suffix (`bytes=-n`). Multi-range
+requests are intentionally unsupported and receive `416`.
+
 ## 6. The Hub API's xet-token response is a JSON body, not headers-only
 
 `GET /api/{repo_type}s/{repo_id}/xet-{read,write}-token/{revision}` looked

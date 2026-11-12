@@ -39,6 +39,24 @@ func (s *Server) IngestFile(repoType, repoID, revision, path, sha256Hex string, 
 	rs := s.getOrCreateRepo(repoType, repoID)
 	vs := rs.getOrCreateRevision(revision)
 	vs.mu.Lock()
+	// Repo-info's sibling list and tree listings can both arrive without a
+	// per-file Xet hash (or with size 0). Both are useful for existence/
+	// listing, but neither may clobber richer resolve/tree metadata already
+	// learned for the same path: a concurrent upstream repo-info response
+	// used to overwrite a real XetHash with zero, after which the fast-path
+	// resolve 404'd until the next live resolve repaired it. Merge the
+	// missing fields instead of replacing them.
+	if existing, ok := vs.files[path]; ok {
+		if sha256Hex == "" {
+			sha256Hex = existing.SHA256Hex
+		}
+		if size == 0 {
+			size = existing.Size
+		}
+		if xetHash.IsZero() {
+			xetHash = existing.XetHash
+		}
+	}
 	vs.files[path] = &fileRef{Path: path, SHA256Hex: sha256Hex, Size: size, XetHash: xetHash}
 	vs.mu.Unlock()
 }

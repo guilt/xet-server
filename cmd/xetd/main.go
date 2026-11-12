@@ -122,6 +122,9 @@ func main() {
 	} else if added > 0 {
 		slog.Info("indexed shards not covered by the snapshot", "added", added)
 	}
+	// The snapshot is only an index; correct any stale xorb lengths against
+	// the content-addressed blobs on disk before serving.
+	casSrv.ReconcileXorbLengths(context.Background())
 	if *syncFolder {
 		slog.Info("synced-folder mode: no snapshots; state is derived from the files in -data", "dataDir", *dataDir, "rescanInterval", *rescanInterval)
 		if *maxStorageBytes > 0 {

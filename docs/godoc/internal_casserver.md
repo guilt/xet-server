@@ -352,6 +352,18 @@ func (s *Server) MissingXorbs(ctx context.Context, fileHash merklehash.Hash) ([]
     ErrUnknownFile if no shard describes the file. An empty result means
     ReconstructFile can serve the whole file now.
 
+func (s *Server) ReconcileXorbLengths(ctx context.Context)
+    ReconcileXorbLengths corrects xorbRawLength from the actual stored blob
+    size and invalidates footers for any entry whose size changed (forcing the
+    footer to be re-derived from the real bytes on next use). Entries whose
+    blob is gone are dropped entirely, along with any file reconstruction
+    that referenced them, so a proxy refetches instead of advertising a
+    reconstruction it can no longer serve.
+
+    It is safe to call once at startup after LoadSnapshot, before serving
+    traffic. Backends without storage.Enumerator (and wrapped stores exposing
+    one via storage.Unwrapper) are left untouched.
+
 func (s *Server) ReconstructFile(ctx context.Context, fileHash merklehash.Hash, start, end int64, w io.Writer) error
     ReconstructFile writes bytes [start, end] (inclusive, like an HTTP Range) of
     the file identified by fileHash to w, decompressing each chunk from its xorb

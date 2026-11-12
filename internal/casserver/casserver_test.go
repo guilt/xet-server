@@ -780,6 +780,24 @@ func TestReconstruction_RangePastEOFReturns416(t *testing.T) {
 		body, _ := io.ReadAll(inBoundsResp.Body)
 		t.Errorf("status = %d, want 200 for an in-bounds Range; body = %s", inBoundsResp.StatusCode, body)
 	}
+
+	// Real hf_xet requests the whole reconstruction with the open-ended
+	// form "bytes=0-". That must be a 200 with the whole body, not 416.
+	req3, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/reconstructions/"+fileHash.Hex(), nil)
+	req3.Header.Set("Range", "bytes=0-")
+	openResp, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatalf("GET with open-ended Range error = %v", err)
+	}
+	defer openResp.Body.Close()
+	if openResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(openResp.Body)
+		t.Fatalf("status = %d, want 200 for open-ended Range bytes=0-; body = %s", openResp.StatusCode, body)
+	}
+	openBody, _ := io.ReadAll(openResp.Body)
+	if len(openBody) == 0 {
+		t.Error("open-ended Range bytes=0- returned an empty body")
+	}
 }
 
 // TestEvictionCandidates_ExcludesInFlightFetch confirms a xorb currently
