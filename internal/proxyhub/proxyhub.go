@@ -254,6 +254,27 @@ func (s *Server) recordFileSize(xetHash merklehash.Hash, size int64) {
 	s.fileSizeMu.Unlock()
 }
 
+// RehydrateFileSizes rebuilds this package's verified-size index from the
+// file refs embedded in the embedded hubserver's snapshot. The snapshot
+// persists each file's path/size/XetHash but this package's separate
+// fileSizeByXetHash map is intentionally not persisted; without
+// rehydration, a resolve that falls back to Embedded after an upstream
+// timeout/rate-limit has the file's XetHash but not its size, so
+// hubserver's resolve handler returns 404 for a file the proxy can
+// actually serve. Call once after LoadSnapshot, before serving.
+func (s *Server) RehydrateFileSizes() {
+	sizes := s.Embedded.FileSizesByXetHash()
+	if len(sizes) == 0 {
+		return
+	}
+	s.fileSizeMu.Lock()
+	for hash, size := range sizes {
+		s.fileSizeByXetHash[hash] = size
+	}
+	s.fileSizeMu.Unlock()
+	slog.Info("proxyhub: rehydrated file sizes from snapshot", "count", len(sizes))
+}
+
 // SetAuthenticator gates this package's own handlers (see
 // authenticator's doc comment on proxycas.Server for why this package
 // needs its own copy, checked before any upstream call - the same

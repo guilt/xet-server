@@ -130,6 +130,10 @@ func main() {
 	if err := hubSrv.Embedded.LoadSnapshot(hubSnapshotPath); err != nil {
 		log.Fatalf("load Hub snapshot: %v", err)
 	}
+	// The snapshot persists file refs but not this proxy's separate
+	// verified-size index; rebuild it so an offline/rate-limited resolve
+	// fallback can answer instead of 404ing a file whose Xet hash it knows.
+	hubSrv.RehydrateFileSizes()
 
 	if *rateLimitRPS > 0 {
 		// One Limiter shared across both ports/packages: a client

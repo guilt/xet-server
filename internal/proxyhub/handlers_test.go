@@ -14,6 +14,7 @@ import (
 
 	"github.com/guilt/xet-server/internal/auth"
 	"github.com/guilt/xet-server/internal/hfclient"
+	"github.com/guilt/xet-server/internal/merklehash"
 )
 
 const testFixtureToken = "test-fixture-token-not-a-real-secret"
@@ -80,6 +81,111 @@ func TestPreupload_SendsFilesAndReturnsNegotiatedModes(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&result)
 	if len(result.Files) != 1 || result.Files[0].UploadMode != "lfs" {
 		t.Errorf("result = %+v, want one lfs entry", result.Files)
+	}
+}
+
+func TestResolve_UsesTreeMetadataWithoutPerFileUpstreamCall(t *testing.T) {
+	resolveCalls := 0
+	xetHash := strings.Repeat("12", 32)
+	hubTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/tree/"):
+			json.NewEncoder(w).Encode([]hfclient.TreeEntry{
+				{Type: "file", Path: "dog/a.wav", Size: 1234, OID: "aaa", XetHash: xetHash},
+			})
+		case strings.Contains(r.URL.Path, "/resolve/"):
+			resolveCalls++
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hubTS.Close()
+
+	s := newTestServer(hubTS, "http://localhost:8420")
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	treeResp, err := http.Get(ts.URL + "/api/datasets/alice/repo/tree/main")
+	if err != nil {
+		t.Fatalf("tree GET error = %v", err)
+	}
+	treeResp.Body.Close()
+	if treeResp.StatusCode != http.StatusOK {
+		t.Fatalf("tree status = %d, want 200", treeResp.StatusCode)
+	}
+
+	req, _ := http.NewRequest(http.MethodHead, ts.URL+"/datasets/alice/repo/resolve/main/dog/a.wav", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("resolve HEAD error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("resolve status = %d, want 200 from tree metadata", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Xet-Hash"); got != xetHash {
+		t.Errorf("X-Xet-Hash = %q, want tree entry's %q", got, xetHash)
+	}
+	if resolveCalls != 0 {
+		t.Errorf("upstream resolve called %d time(s), want 0 when a tree listing already has the file", resolveCalls)
+	}
+}
+
+func TestRehydrateFileSizes_RestoresSnapshotMetadata(t *testing.T) {
+	s := newTestServer(httptest.NewServer(http.NotFoundHandler()), "http://localhost:8420")
+	hash, err := merklehash.FromHex(strings.Repeat("34", 32))
+	if err != nil {
+		t.Fatalf("FromHex() error = %v", err)
+	}
+	s.Embedded.IngestFile("model", "alice/repo", "main", "a.bin", "oid", 1234, hash)
+
+	s.RehydrateFileSizes()
+
+	if got, ok := s.FileSize(hash); !ok || got != 1234 {
+		t.Errorf("FileSize() = (%d, %v), want (1234, true)", got, ok)
+	}
+}
+
+func TestResolve_NonXetTreeEntryFallsThroughToLiveRelay(t *testing.T) {
+	resolveCalls := 0
+	hubTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/tree/"):
+			json.NewEncoder(w).Encode([]hfclient.TreeEntry{
+				{Type: "file", Path: "README.md", Size: 10, OID: "aaa"},
+			})
+		case strings.Contains(r.URL.Path, "/resolve/"):
+			resolveCalls++
+			w.Header().Set("Content-Length", "10")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hubTS.Close()
+
+	s := newTestServer(hubTS, "http://localhost:8420")
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	treeResp, err := http.Get(ts.URL + "/api/datasets/alice/repo/tree/main")
+	if err != nil {
+		t.Fatalf("tree GET error = %v", err)
+	}
+	treeResp.Body.Close()
+
+	req, _ := http.NewRequest(http.MethodHead, ts.URL+"/datasets/alice/repo/resolve/main/README.md", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("resolve HEAD error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("resolve status = %d, want 200 via live relay for a non-Xet tree entry", resp.StatusCode)
+	}
+	if resolveCalls == 0 {
+		t.Error("upstream resolve was not consulted for a zero-XetHash tree entry")
 	}
 }
 

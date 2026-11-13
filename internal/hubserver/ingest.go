@@ -61,6 +61,69 @@ func (s *Server) IngestFile(repoType, repoID, revision, path, sha256Hex string, 
 	vs.mu.Unlock()
 }
 
+// HasResolvableFile reports whether path has a non-zero Xet hash in the
+// embedded index. A tree/repo-info entry can exist with only a path (or a
+// zero hash) for a non-Xet small file; serving that through the embedded
+// resolve handler would 404. The proxy uses this to decide whether its
+// tree-metadata fast path is safe, falling through to the live Hub relay
+// for non-Xet files instead.
+func (s *Server) HasResolvableFile(repoType, repoID, revision, path string) bool {
+	s.mu.RLock()
+	rs := s.repos[repoKey{repoType, repoID}]
+	s.mu.RUnlock()
+	if rs == nil {
+		return false
+	}
+	rs.mu.RLock()
+	vs := rs.revisions[revision]
+	rs.mu.RUnlock()
+	if vs == nil {
+		return false
+	}
+	vs.mu.RLock()
+	ref := vs.files[path]
+	vs.mu.RUnlock()
+	return ref != nil && !ref.XetHash.IsZero()
+}
+
+// FileSizesByXetHash returns every known non-zero file Xet hash paired with
+// the size upstream declared for it. A proxy embedding this server uses it
+// to rehydrate its in-memory verified-size index after loading a snapshot:
+// the snapshot persists file refs (path, size, XetHash) but not the proxy's
+// separate size map, so without this a post-restart resolve fallback would
+// find the file hash but not its size and 404 a perfectly cacheable file.
+func (s *Server) FileSizesByXetHash() map[merklehash.Hash]int64 {
+	s.mu.RLock()
+	repos := make([]*repoState, 0, len(s.repos))
+	for _, rs := range s.repos {
+		repos = append(repos, rs)
+	}
+	s.mu.RUnlock()
+
+	sizes := make(map[merklehash.Hash]int64)
+	for _, rs := range repos {
+		rs.mu.RLock()
+		revs := make([]*revisionState, 0, len(rs.revisions))
+		for _, vs := range rs.revisions {
+			revs = append(revs, vs)
+		}
+		rs.mu.RUnlock()
+		for _, vs := range revs {
+			vs.mu.RLock()
+			for _, ref := range vs.files {
+				if ref.XetHash.IsZero() || ref.Size <= 0 {
+					continue
+				}
+				if _, ok := sizes[ref.XetHash]; !ok {
+					sizes[ref.XetHash] = ref.Size
+				}
+			}
+			vs.mu.RUnlock()
+		}
+	}
+	return sizes
+}
+
 // IngestCommit records commitOID as repoType/repoID/revision's current
 // commit - for a caller that relayed a real commit write-through to the
 // real Hub (which mints the actual commitOID) rather than generating one

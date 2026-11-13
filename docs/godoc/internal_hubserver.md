@@ -75,6 +75,14 @@ func (s *Server) FileSHA256s() []string
     git-lfs bridge are not registered here (docs/GIT_LFS.md, known limits),
     which is why that keep list exists.
 
+func (s *Server) FileSizesByXetHash() map[merklehash.Hash]int64
+    FileSizesByXetHash returns every known non-zero file Xet hash paired with
+    the size upstream declared for it. A proxy embedding this server uses it
+    to rehydrate its in-memory verified-size index after loading a snapshot:
+    the snapshot persists file refs (path, size, XetHash) but not the proxy's
+    separate size map, so without this a post-restart resolve fallback would
+    find the file hash but not its size and 404 a perfectly cacheable file.
+
 func (s *Server) HasFile(repoType, repoID, revision, path string) bool
     HasFile reports whether path has been recorded (via a real commit or
     IngestFile) under repoType/repoID/revision.
@@ -87,6 +95,14 @@ func (s *Server) HasRepo(repoType, repoID string) bool
     locally via HasRevision/HasFile directly, since those already imply the repo
     exists. Exported for test/diagnostic observability (see ingest_test.go and
     proxyhub_test.go).
+
+func (s *Server) HasResolvableFile(repoType, repoID, revision, path string) bool
+    HasResolvableFile reports whether path has a non-zero Xet hash in the
+    embedded index. A tree/repo-info entry can exist with only a path (or a zero
+    hash) for a non-Xet small file; serving that through the embedded resolve
+    handler would 404. The proxy uses this to decide whether its tree-metadata
+    fast path is safe, falling through to the live Hub relay for non-Xet files
+    instead.
 
 func (s *Server) HasRevision(repoType, repoID, revision string) bool
     HasRevision reports whether repoType/repoID has revision locally, without

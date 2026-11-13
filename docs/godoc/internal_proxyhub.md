@@ -134,6 +134,16 @@ func (s *Server) ReconstructFile(context.Context, merklehash.Hash, int64, int64,
     internal/proxycas), so the bridge is not available through it: point git-lfs
     at a real xetd instead.
 
+func (s *Server) RehydrateFileSizes()
+    RehydrateFileSizes rebuilds this package's verified-size index from the file
+    refs embedded in the embedded hubserver's snapshot. The snapshot persists
+    each file's path/size/XetHash but this package's separate fileSizeByXetHash
+    map is intentionally not persisted; without rehydration, a resolve that
+    falls back to Embedded after an upstream timeout/rate-limit has the file's
+    XetHash but not its size, so hubserver's resolve handler returns 404 for
+    a file the proxy can actually serve. Call once after LoadSnapshot, before
+    serving.
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) SetAuthenticator(a auth.Authenticator)

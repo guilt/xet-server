@@ -42,7 +42,20 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request, repoType,
 		return
 	}
 
-	if s.resolveFreshness.Fresh(key, s.CacheTTL) && s.Embedded.HasFile(repoType, repoID, revision, filename) {
+	// A completed tree listing already carries every file's Xet hash and
+	// size, and handleListTree ingests both into Embedded. Use that snapshot
+	// to answer resolves directly instead of making one upstream HEAD per
+	// file. Without this, a large repo (a 248k-file speech dataset, for
+	// example) issues one resolve HEAD per file, which both wastes round
+	// trips and trips Hugging Face's rate limiter; the resulting upstream
+	// failures then fell back to an incomplete cached entry and surfaced as
+	// spurious 404s. The tree key includes the caller credential, and the
+	// tree is scoped to the same repo/revision, so serving from it cannot
+	// cross principals or revisions.
+	treeKey := cacheKey(repoType, repoID, revision, credentialFingerprint(r))
+	_, treeKnown, _ := s.treeFreshness.Get(treeKey, -1)
+	if s.Embedded.HasResolvableFile(repoType, repoID, revision, filename) &&
+		(s.resolveFreshness.Fresh(key, s.CacheTTL) || treeKnown) {
 		s.Embedded.ServeHTTP(w, r)
 		return
 	}

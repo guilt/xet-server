@@ -187,6 +187,18 @@ your `HF_ENDPOINT` to confirm the file is really there) - a
 silently-failed upload with no local error is the most common cause of
 "it's not there on the other end."
 
+**A whole-repo download aborts on one `403`/`404` file that the tree lists.**
+Some repos contain LFS pointers whose objects are missing from Hugging
+Face's LFS store. `hf download` aborts the whole snapshot because it
+cannot fetch that one required blob (the client wraps it as
+`Local entry not found`, even though the resolve request returned 403).
+The tree entry is real, but the blob is not downloadable, so no proxy or
+`xetd` change can recover it. Exclude those paths explicitly, e.g.
+`--exclude path/to/dead.wav`, or keep the job's `Exclude` list in the
+mirror script up to date. Verify a suspect file without a proxy first: a
+direct `hf download` from `https://huggingface.co` fails identically, and
+the Git LFS batch API returns `404 Object does not exist`.
+
 **Disk filling up over time.** Every uploaded chunk is retained forever by
 default. See
 [storage auto-pruning](../README.md#storage-auto-pruning-upload-rate-limiting-dedup-verification-and-persistence)

@@ -109,6 +109,49 @@ func TestIngestFile_ZeroHashDoesNotClobberRicherMetadata(t *testing.T) {
 	}
 }
 
+func TestHasResolvableFile_RequiresNonZeroXetHash(t *testing.T) {
+	s := newIngestTestServer(t)
+	xetHash := hashFromByte(0xAB)
+	s.IngestFile("model", "alice/my-model", "main", "real.bin", "deadbeef", 1024, xetHash)
+	s.IngestFile("model", "alice/my-model", "main", "plain.txt", "cafebabe", 10, merklehash.Hash{})
+
+	if !s.HasResolvableFile("model", "alice/my-model", "main", "real.bin") {
+		t.Error("HasResolvableFile() = false for a file with a non-zero Xet hash")
+	}
+	if s.HasResolvableFile("model", "alice/my-model", "main", "plain.txt") {
+		t.Error("HasResolvableFile() = true for a non-Xet file with a zero Xet hash")
+	}
+	if s.HasResolvableFile("model", "alice/my-model", "main", "missing.bin") {
+		t.Error("HasResolvableFile() = true for a missing file")
+	}
+}
+
+func TestFileSizesByXetHash_ReturnsCommittedFiles(t *testing.T) {
+	s := newIngestTestServer(t)
+	xetHash := hashFromByte(0xAB)
+	s.IngestFile("model", "alice/my-model", "main", "model.bin", "deadbeef", 1024, xetHash)
+	// A bare sibling entry must not overwrite the richer one.
+	s.IngestFile("model", "alice/my-model", "main", "model.bin", "", 0, merklehash.Hash{})
+
+	sizes := s.FileSizesByXetHash()
+	if got := sizes[xetHash]; got != 1024 {
+		t.Errorf("FileSizesByXetHash()[%v] = %d, want 1024", xetHash, got)
+	}
+	if len(sizes) != 1 {
+		t.Errorf("FileSizesByXetHash() = %d entries, want 1", len(sizes))
+	}
+}
+
+func TestFileSizesByXetHash_OmitsZeroHashesAndSizes(t *testing.T) {
+	s := newIngestTestServer(t)
+	s.IngestFile("model", "alice/my-model", "main", "bare.bin", "deadbeef", 1024, merklehash.Hash{})
+	s.IngestFile("model", "alice/my-model", "main", "zero-size.bin", "cafebabe", 0, hashFromByte(0xCD))
+
+	if sizes := s.FileSizesByXetHash(); len(sizes) != 0 {
+		t.Errorf("FileSizesByXetHash() = %v, want empty for zero-hash/zero-size refs", sizes)
+	}
+}
+
 func TestHasRepo_UnknownRepoReturnsFalse(t *testing.T) {
 	s := newIngestTestServer(t)
 	if s.HasRepo("model", "nobody/nothing") {

@@ -5,6 +5,52 @@ All notable changes to Xet Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-11-13
+
+Large-repository cache-hydration release. This closes the remaining
+per-file upstream round-trips that surfaced as 404/429 failures on the
+248k-file `multilingual-speech-commands-15lang` mirror, and makes the
+proxy's snapshot-restored cache usable by a plain `xetd` immediately
+after restart.
+
+### Fixed
+
+- **Upstream HTTP connections are bounded and reused.** A many-file
+  mirror previously opened and closed a fresh upstream connection for
+  nearly every resolve/xet-token/reconstruction/xorb request because
+  Go's default per-host idle pool is only two connections. On Windows
+  this churned through ephemeral ports until dials failed with
+  `Only one usage of each socket address ...`, which surfaced as
+  spurious reconstruction 502s. `hfclient.defaultHTTPClient` now keeps
+  a 256-connection idle pool, 64 idle connections per host, a finite
+  64-connection per-host cap, and a 90-second idle timeout.
+
+- **Resolve uses completed tree metadata instead of one upstream HEAD
+  per file.** `hubserver` tree ingestion already records each file's
+  Xet hash and size. `proxyhub` now answers a resolve from that
+  snapshot whenever the credential-scoped tree was fetched, avoiding
+  one live Hub HEAD per file and the rate-limit failures those HEADs
+  caused. The tree fast path is only used for files with a non-zero Xet
+  hash; non-Xet blobs (`README.md`, `.gitattributes`, label maps) fall
+  through to the live Hub relay.
+
+- **File sizes are rehydrated after a snapshot restart.** The proxy
+  snapshot persists file refs but not the proxy's separate verified-size
+  index. Without rehydration, a resolve that fell back to the embedded
+  server after an upstream timeout had a file's Xet hash but not its
+  size, returning a spurious 404 for a cacheable file.
+  `proxyhub.RehydrateFileSizes` restores the index from the embedded
+  hub snapshot at startup, and `hubserver.FileSizesByXetHash` supplies
+  the data.
+
+### Added
+
+- `hubserver.HasResolvableFile`, which keeps the tree fast path from
+  serving a zero-Xet-hash entry through the CAS-backed resolver.
+- Regression tests for upstream transport bounds/reuse, tree-metadata
+  resolve without per-file HEADs, non-Xet fall-through, file-size
+  rehydration, and the zero-hash guard.
+
 ## [1.5.0] - 2026-11-11
 
 Mirroring-correctness release for long-running `hf` downloads and

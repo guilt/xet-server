@@ -53,11 +53,26 @@ import (
 var defaultHTTPClient = &http.Client{
 	Transport: &http.Transport{
 		DialContext: (&net.Dialer{
-			Timeout: 10 * time.Second,
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		// Bound and reuse upstream connections. A many-file mirror (a
+		// 248k-file speech dataset, for example) makes one resolve/xet-token/
+		// reconstruction/xorb request per file; with the default two idle
+		// connections per host, Go opens a fresh connection for nearly every
+		// concurrent request and closes it immediately afterward. On Windows
+		// that churns through ephemeral ports until dials fail with
+		// "Only one usage of each socket address ...", which surfaced as
+		// spurious reconstruction 502s during a long mirror. Keep a healthy
+		// idle pool and cap concurrent connections per host so requests queue
+		// instead of exhausting the local port range.
+		MaxIdleConns:        256,
+		MaxIdleConnsPerHost: 64,
+		MaxConnsPerHost:     64,
+		IdleConnTimeout:     90 * time.Second,
 	},
 }
 
